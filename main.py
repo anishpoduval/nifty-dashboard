@@ -1,588 +1,421 @@
-import os
+import os, time, pyotp, requests
 from flask import Flask, jsonify, render_template_string
-import requests, json, time, threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
 
-# ─── In-memory cache ──────────────────────────────────────────
-_cache = {"data": None, "ts": 0}
-CACHE_TTL = 120  # seconds
+API_KEY     = os.environ.get("ANGEL_API_KEY", "")
+CLIENT_CODE = os.environ.get("ANGEL_CLIENT_CODE", "")
+ANGEL_PIN   = os.environ.get("ANGEL_PIN", "")
+TOTP_SECRET = os.environ.get("ANGEL_TOTP_SECRET", "")
+BASE        = "https://apiconnect.angelbroking.com"
+_cache      = {"data": None, "ts": 0, "jwt": None, "jwt_ts": 0}
+CACHE_TTL   = 120
 
-# ─── NSE Helpers ──────────────────────────────────────────────
-def nse_session():
-    s = requests.Session()
-    hdrs = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": ("text/html,application/xhtml+xml,application/xml;"
-                   "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
-        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
+def ah(jwt=None):
+    h = {
+        "Content-Type":     "application/json",
+        "Accept":           "application/json",
+        "X-UserType":       "USER",
+        "X-SourceID":       "WEB",
+        "X-ClientLocalIP":  "127.0.0.1",
+        "X-ClientPublicIP": "106.193.147.98",
+        "X-MACAddress":     "fe80::216e:6507:4b90:3719",
+        "X-PrivateKey":     API_KEY,
     }
-    s.headers.update(hdrs)
+    if jwt:
+        h["Authorization"] = f"Bearer {jwt}"
+    return h
+
+def login():
+    if _cache["jwt"] and time.time() - _cache["jwt_ts"] < 3600:
+        return _cache["jwt"]
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    r = requests.post(
+        f"{BASE}/rest/auth/angelbroking/user/v1/loginByPassword",
+        json={"clientcode": CLIENT_CODE, "password": ANGEL_PIN, "totp": totp},
+        headers=ah(), timeout=15)
+    d = r.json()
+    if d.get("status") and d.get("data", {}).get("jwtToken"):
+        _cache["jwt"] = d["data"]["jwtToken"]
+        _cache["jwt_ts"] = time.time()
+        return _cache["jwt"]
+    raise Exception(f"Login failed: {d.get('message','Unknown')} | {d}")
+
+def nifty_spot(jwt):
+    r = requests.post(
+        f"{BASE}/rest/secure/angelbroking/market/v1/quote/",
+        json={"mode": "LTP", "exchangeTokens": {"NSE": ["26000"]}},
+        headers=ah(jwt), timeout=10)
+    d = r.json()
+    fetched = d.get("data", {}).get("fetched", [])
+    if fetched:
+        return float(fetched[0]["ltp"])
+    raise Exception(f"Spot failed: {d}")
+
+def next_thursday():
+    today = date.today()
+    days  = (3 - today.weekday()) % 7
+    if days == 0:
+        now = datetime.now()
+        if now.hour >= 15 and now.minute >= 30:
+            days = 7
+    exp = today + timedelta(days=days)
+    return exp.strftime("%d%b%Y").upper()
+
+def get_option_chain(jwt, expiry):
     try:
-        r1 = s.get("https://www.nseindia.com", timeout=20)
-        time.sleep(3)
-        r2 = s.get("https://www.nseindia.com/market-data/live-equity-market",
-                   timeout=20)
-        time.sleep(2)
-        s.headers.update({
-            "Referer": "https://www.nseindia.com/option-chain",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        })
-        time.sleep(1)
+        r = requests.post(
+            f"{BASE}/rest/secure/angelbroking/marketData/v1/optionChain",
+            json={"name": "NIFTY", "expirydate": expiry},
+            headers=ah(jwt), timeout=15)
+        d = r.json()
+        if d.get("data"):
+            return d["data"]
     except Exception:
         pass
-    return s
+    return None
 
-
-def fetch_chain(s):
-    urls = [
-        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
-        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY&identifier=OPTIDXNIFTY",
-    ]
-    for url in urls:
-        try:
-            r = s.get(url, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            if "records" in data:
-                return data
-            time.sleep(2)
-        except Exception:
-            time.sleep(2)
-            continue
-    raise Exception("NSE blocked all attempts — retrying in 90s")
-
-
-def fetch_fii(s):
-    try:
-        r = s.get("https://www.nseindia.com/api/fiidiiTradeReact", timeout=10)
-        return r.json()[:6]
-    except Exception:
-        return []
-
-
-def parse_chain(data):
-    spot = data["records"]["underlyingValue"]
-    expiries = data["records"]["expiryDates"]
-    rows = []
-    for rec in data["records"]["data"]:
-        ce, pe = rec.get("CE", {}), rec.get("PE", {})
-        rows.append({
-            "strike":   rec["strikePrice"],
-            "expiry":   rec.get("expiryDate", ""),
-            "c_oi":     ce.get("openInterest", 0),
-            "c_chg":    ce.get("changeinOpenInterest", 0),
-            "c_ltp":    ce.get("lastPrice", 0),
-            "c_iv":     ce.get("impliedVolatility", 0),
-            "p_oi":     pe.get("openInterest", 0),
-            "p_chg":    pe.get("changeinOpenInterest", 0),
-            "p_ltp":    pe.get("lastPrice", 0),
-            "p_iv":     pe.get("impliedVolatility", 0),
-        })
-    return rows, spot, expiries
-
-
-def pcr(rows, exp=None):
-    f = [r for r in rows if not exp or r["expiry"] == exp]
-    c = sum(r["c_oi"] for r in f)
-    p = sum(r["p_oi"] for r in f)
-    return round(p / c, 2) if c else 0, c, p
-
-
-def max_pain(rows, exp=None):
-    f = [r for r in rows if not exp or r["expiry"] == exp]
-    if not f:
-        return 0
-    best, best_s = float("inf"), 0
-    for s in set(r["strike"] for r in f):
-        cl = sum(max(0, s - r["strike"]) * r["c_oi"] for r in f)
-        pl = sum(max(0, r["strike"] - s) * r["p_oi"] for r in f)
-        if cl + pl < best:
-            best, best_s = cl + pl, s
-    return best_s
-
-
-def oi_walls(rows, spot, exp=None, n=5):
-    f = [r for r in rows if not exp or r["expiry"] == exp]
-    above = sorted([r for r in f if r["strike"] > spot],  key=lambda x: -x["c_oi"])[:n]
-    below = sorted([r for r in f if r["strike"] <= spot], key=lambda x: -x["p_oi"])[:n]
-    return above, below
-
-
-def signal(p):
-    if p >= 1.3: return "STRONGLY BULLISH", "BUY CALL", "green"
-    if p >= 1.1: return "BULLISH",          "BUY CALL", "green"
+def pcr_signal(p):
+    if p >= 1.4: return "STRONGLY BULLISH", "BUY CALL", "green"
+    if p >= 1.2: return "BULLISH",          "BUY CALL", "green"
+    if p >= 1.0: return "MILDLY BULLISH",   "BUY CALL", "green"
     if p >= 0.9: return "NEUTRAL",           "WAIT",     "gold"
-    if p >= 0.7: return "BEARISH",           "BUY PUT",  "red"
+    if p >= 0.75:return "MILDLY BEARISH",   "BUY PUT",  "red"
+    if p >= 0.6: return "BEARISH",           "BUY PUT",  "red"
     return               "STRONGLY BEARISH", "BUY PUT",  "red"
 
-
-# ─── Core Analysis ────────────────────────────────────────────
 def analyse():
-    s = nse_session()
-    raw = fetch_chain(s)
-    rows, spot, expiries = parse_chain(raw)
+    jwt    = login()
+    spot   = nifty_spot(jwt)
+    atm    = round(spot / 50) * 50
+    expiry = next_thursday()
+    chain  = get_option_chain(jwt, expiry)
+    chain_live = False
 
-    exp0 = expiries[0] if expiries else None
-    exp1 = expiries[1] if len(expiries) > 1 else None
+    if chain:
+        chain_live = True
+        call_oi, put_oi = {}, {}
+        for row in chain:
+            sp = row.get("strikePrice", row.get("strike", 0))
+            try:
+                sp = int(float(sp))
+            except:
+                continue
+            # Handle different Angel One response formats
+            ce = row.get("CE") or {}
+            pe = row.get("PE") or {}
+            if isinstance(ce, dict):
+                coi = ce.get("openInterest", 0)
+            else:
+                coi = row.get("CE_openInterest", 0) or row.get("callOI", 0)
+            if isinstance(pe, dict):
+                poi = pe.get("openInterest", 0)
+            else:
+                poi = row.get("PE_openInterest", 0) or row.get("putOI", 0)
+            try: call_oi[sp] = int(coi)
+            except: pass
+            try: put_oi[sp]  = int(poi)
+            except: pass
 
-    pcr_w, c_oi, p_oi = pcr(rows, exp0)
-    pcr_a, _, _       = pcr(rows)
-    mp                = max_pain(rows, exp0)
-    calls, puts       = oi_walls(rows, spot, exp0)
-    bias, sig, color  = signal(pcr_a)
-    atm               = round(spot / 50) * 50
+        tot_c = sum(call_oi.values())
+        tot_p = sum(put_oi.values())
+        pcr   = round(tot_p / tot_c, 2) if tot_c > 0 else 1.0
+        calls = sorted([(s,o) for s,o in call_oi.items() if s > spot],  key=lambda x:-x[1])[:5]
+        puts  = sorted([(s,o) for s,o in put_oi.items()  if s <= spot], key=lambda x:-x[1])[:5]
+        cw1   = calls[0][0] if calls else atm+500
+        pw1   = puts[0][0]  if puts  else atm-500
+        call_list = [{"s":s,"oi":round(o/100000,1)} for s,o in calls[:4]]
+        put_list  = [{"s":s,"oi":round(o/100000,1)} for s,o in puts[:4]]
+        c_cr  = round(tot_c/10000000, 2)
+        p_cr  = round(tot_p/10000000, 2)
 
-    # Straddle
-    atm_row = next((r for r in rows if r["strike"] == atm
-                    and (not exp0 or r["expiry"] == exp0)), None)
-    straddle = round(atm_row["c_ltp"] + atm_row["p_ltp"], 2) if atm_row else 0
+        # Max pain
+        mp = atm
+        try:
+            strikes = sorted(set(list(call_oi.keys()) + list(put_oi.keys())))
+            best = float("inf")
+            for s in strikes:
+                cl = sum(max(0,s-k)*v for k,v in call_oi.items())
+                pl = sum(max(0,k-s)*v for k,v in put_oi.items())
+                if cl+pl < best:
+                    best, mp = cl+pl, s
+        except:
+            mp = atm
+    else:
+        # Estimated from spot
+        pcr  = 1.0
+        cw1  = int(round(spot/500 + 0.5) * 500)
+        pw1  = int(round(spot/500 - 0.5) * 500)
+        mp   = atm
+        c_cr = p_cr = 0.0
+        call_list = [{"s":cw1,"oi":"--"},{"s":cw1+500,"oi":"--"}]
+        put_list  = [{"s":pw1,"oi":"--"},{"s":pw1-500,"oi":"--"}]
 
-    # Strikes
-    cw1 = calls[0]["strike"] if calls else atm + 200
-    pw1 = puts[0]["strike"]  if puts  else atm - 200
+    bias, sig, sc = pcr_signal(pcr)
+    straddle = round(spot * 0.20 * (5/252)**0.5 / 50) * 50
 
     if "CALL" in sig:
-        buy    = f"{atm+50} CE  or  {atm+100} CE"
-        hedge  = f"{atm-200} PE"
-        t1, t2 = cw1, cw1 + 100
+        buy   = f"{atm+50} CE  or  {atm+100} CE"
+        hedge = f"{atm-200} PE"
+        t1, t2 = cw1, cw1+100
+        note  = f"Bullish bias (PCR {pcr}). Put floor at {pw1}. Call ceiling at {cw1} is target."
     elif "PUT" in sig:
-        buy    = f"{atm-50} PE  or  {atm-100} PE"
-        hedge  = f"{atm+200} CE"
-        t1, t2 = pw1, pw1 - 100
+        buy   = f"{atm-50} PE  or  {atm-100} PE"
+        hedge = f"{atm+200} CE"
+        t1, t2 = pw1, pw1-100
+        note  = f"Bearish bias (PCR {pcr}). Call wall {cw1} is capping. Put wall {pw1} is target."
     else:
-        buy    = "Wait — confirm 9:30 AM candle"
-        hedge  = "—"
+        buy   = "Wait — confirm 9:30 AM candle direction"
+        hedge = "—"
         t1, t2 = cw1, pw1
-
-    fii_raw = fetch_fii(s)
-    fii_rows = []
-    for row in fii_raw:
-        name = row.get("category", "")
-        net  = row.get("netValue", 0)
-        fii_rows.append({"name": name, "net": net,
-                          "color": "green" if net > 0 else "red"})
+        note  = f"Neutral PCR {pcr}. Wait for 9:30 candle — Bull: {atm+50}CE | Bear: {atm-50}PE"
 
     return {
-        "spot":       spot,
-        "atm":        atm,
-        "pcr_week":   pcr_w,
-        "pcr_all":    pcr_a,
-        "c_oi_cr":    round(c_oi / 100, 2),
-        "p_oi_cr":    round(p_oi / 100, 2),
-        "max_pain":   mp,
-        "straddle":   straddle,
-        "range_low":  round(spot - straddle),
-        "range_high": round(spot + straddle),
-        "bias":       bias,
-        "signal":     sig,
-        "sig_color":  color,
-        "buy":        buy,
-        "hedge":      hedge,
-        "t1": t1, "t2": t2,
-        "exp0":       exp0,
-        "exp1":       exp1,
-        "calls": [{"s": r["strike"],
-                   "oi": round(r["c_oi"]/100, 1),
-                   "chg": r["c_chg"]} for r in calls],
-        "puts":  [{"s": r["strike"],
-                   "oi": round(r["p_oi"]/100, 1),
-                   "chg": r["p_chg"]} for r in puts],
-        "fii":   fii_rows,
-        "ts":    datetime.now().strftime("%d %b %Y  %I:%M:%S %p"),
-        "ok":    True,
+        "ok": True, "spot": spot, "atm": atm, "expiry": expiry,
+        "pcr_all": pcr, "c_oi_cr": c_cr, "p_oi_cr": p_cr,
+        "max_pain": mp, "straddle": straddle,
+        "range_low": round(spot - straddle), "range_high": round(spot + straddle),
+        "bias": bias, "signal": sig, "sig_color": sc,
+        "buy": buy, "hedge": hedge, "t1": t1, "t2": t2,
+        "calls": call_list, "puts": put_list, "note": note,
+        "chain_live": chain_live,
+        "ts": datetime.now().strftime("%d %b %Y  %I:%M:%S %p"),
     }
 
-
-# ─── Routes ───────────────────────────────────────────────────
 @app.route("/api/data")
 def api_data():
-    now = time.time()
-    if _cache["data"] and now - _cache["ts"] < CACHE_TTL:
+    if _cache["data"] and time.time() - _cache["ts"] < CACHE_TTL:
         return jsonify(_cache["data"])
     try:
-        data = analyse()
-        _cache["data"] = data
-        _cache["ts"] = now
-        return jsonify(data)
+        d = analyse()
+        _cache["data"] = d
+        _cache["ts"]   = time.time()
+        return jsonify(d)
     except Exception as e:
-        err_msg = str(e)
-        # If NSE blocked, return last cached data with warning
         if _cache["data"]:
-            stale = _cache["data"].copy()
-            stale["warning"] = "NSE blocked fresh fetch. Showing cached data from " + _cache["data"].get("ts","unknown")
+            stale = dict(_cache["data"])
+            stale["warning"] = f"Showing cached — {e}"
             return jsonify(stale)
-        return jsonify({"ok": False, "error": err_msg,
+        return jsonify({"ok": False, "error": str(e),
                         "ts": datetime.now().strftime("%I:%M:%S %p")})
-
 
 @app.route("/")
 def index():
     return render_template_string(HTML)
 
-
-# ─── HTML Dashboard ───────────────────────────────────────────
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+HTML = open_html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NIFTY Dashboard</title>
 <style>
-:root{--bg:#04090f;--card:#070e19;--card2:#091221;--line:#0d1e30;
-  --accent:#00d4ff;--green:#00ff88;--red:#ff3355;--gold:#ffcc00;
-  --muted:#2a4060;--text:#7aaac8;--white:#e8f8ff}
+:root{--bg:#04090f;--card:#070e19;--c2:#091221;--ln:#0d1e30;
+  --acc:#00d4ff;--gr:#00ff88;--rd:#ff3355;--gd:#ffcc00;--mt:#2a4060;--tx:#7aaac8;--wh:#e8f8ff}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;
-  min-height:100vh;padding-bottom:40px}
-.hdr{background:linear-gradient(180deg,#0a1828,#04090f);
-  border-bottom:1px solid var(--line);padding:14px 16px;
-  position:sticky;top:0;z-index:20}
-.hdr-top{display:flex;justify-content:space-between;align-items:center}
-.spot{font-size:28px;font-weight:900;color:var(--white);letter-spacing:-0.5px}
-.chg{font-size:14px;font-weight:700;margin-left:10px}
-.hdr-meta{display:flex;gap:14px;margin-top:6px;font-size:10px;color:var(--muted)}
-.btn{background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.3);
-  border-radius:8px;padding:7px 14px;color:var(--accent);font-size:11px;
-  font-family:inherit;cursor:pointer;letter-spacing:1px}
-.btn:disabled{background:var(--line);border-color:var(--line);color:var(--muted);cursor:default}
+body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;min-height:100vh;padding-bottom:50px}
+.hdr{background:linear-gradient(180deg,#0a1828,#04090f);border-bottom:1px solid var(--ln);
+  padding:12px 14px;position:sticky;top:0;z-index:20}
+.spot{font-size:26px;font-weight:900;color:var(--wh)}
+.btn{background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.3);border-radius:8px;
+  padding:7px 13px;color:var(--acc);font-size:11px;font-family:inherit;cursor:pointer;letter-spacing:1px}
 .wrap{padding:12px 14px;display:flex;flex-direction:column;gap:11px}
-.card{background:var(--card);border-radius:14px;padding:14px;border:1px solid var(--line)}
-.lbl{font-size:9px;color:var(--muted);letter-spacing:3px;margin-bottom:10px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.cell{background:var(--card2);border-radius:8px;padding:10px 12px}
-.cell .l{font-size:8px;color:var(--muted);letter-spacing:1px;margin-bottom:4px}
-.cell .v{font-size:13px;font-weight:700}
-.bar-wrap{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-bottom:6px}
-.bar-fill{height:100%;background:linear-gradient(90deg,var(--red),var(--gold),var(--green));
-  border-radius:4px;transition:width 1s ease}
-.bar-labels{display:flex;justify-content:space-between;font-size:9px;color:var(--muted)}
-.structure{background:var(--card2);border-radius:10px;padding:12px;
-  font-size:12px;line-height:2.4}
-.oi-bar-wrap{margin-bottom:8px}
-.oi-bar-row{display:flex;justify-content:space-between;margin-bottom:3px}
-.oi-bar-bg{height:5px;background:var(--line);border-radius:3px;overflow:hidden}
-.oi-bar-fill{height:100%;border-radius:3px;transition:width .8s}
-.sig-card{border-radius:14px;padding:14px;border-width:2px;border-style:solid}
-.sig-action{font-size:22px;font-weight:900;letter-spacing:.5px;margin-bottom:12px}
-.buy-cell{background:var(--card2);border-radius:8px;padding:12px 14px;margin-bottom:10px}
-.buy-cell .l{font-size:8px;letter-spacing:1px;margin-bottom:4px;color:var(--muted)}
-.buy-cell .v{font-size:15px;font-weight:700}
-.note{background:var(--card2);border-radius:8px;padding:10px 12px;
-  font-size:12px;font-style:italic;line-height:1.6;color:var(--text);margin-top:8px}
-.rules{background:rgba(255,204,0,.04);border:1px solid rgba(255,204,0,.15);
-  border-radius:12px;padding:12px;font-size:11px;color:var(--gold);line-height:2.1}
-.disc{background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.2);
-  border-radius:8px;padding:8px 12px;font-size:10px;color:var(--gold)}
-.err{background:rgba(255,51,85,.06);border:1px solid rgba(255,51,85,.2);
-  border-radius:12px;padding:14px;font-size:12px}
-.spin{display:inline-block;animation:spin 1s linear infinite}
-@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
-.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
-.live-dot{background:var(--green);animation:blink 2s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-.range-bar{height:8px;background:var(--line);border-radius:4px;position:relative;margin-top:4px}
-.range-dot{position:absolute;top:-2px;width:12px;height:12px;border-radius:50%;
-  background:var(--accent);border:2px solid var(--bg);transform:translateX(-50%);transition:left .8s}
-.ts{font-size:9px;color:var(--muted);margin-top:4px}
-.green{color:var(--green)} .red{color:var(--red)} .gold{color:var(--gold)}
-.accent{color:var(--accent)} .white{color:var(--white)}
-</style>
-</head>
-<body>
-
+.card{background:var(--card);border-radius:14px;padding:14px;border:1px solid var(--ln)}
+.lbl{font-size:9px;color:var(--mt);letter-spacing:3px;margin-bottom:10px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.g4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.cell{background:var(--c2);border-radius:8px;padding:10px 12px}
+.cl{font-size:8px;color:var(--mt);letter-spacing:1px;margin-bottom:4px}
+.cv{font-size:13px;font-weight:700}
+.bw{height:8px;background:var(--ln);border-radius:4px;overflow:hidden;margin:8px 0 4px}
+.bf{height:100%;background:linear-gradient(90deg,var(--rd),var(--gd),var(--gr));border-radius:4px;transition:width 1.2s}
+.bl{display:flex;justify-content:space-between;font-size:9px;color:var(--mt)}
+.struct{background:var(--c2);border-radius:10px;padding:12px;font-size:12px;line-height:2.4}
+.oib{margin-bottom:9px}
+.or{display:flex;justify-content:space-between;margin-bottom:3px;font-size:12px}
+.obg{height:5px;background:var(--ln);border-radius:3px;overflow:hidden}
+.ofl{height:100%;border-radius:3px;transition:width .8s}
+.sig{border-radius:14px;padding:14px;border-width:2px;border-style:solid}
+.sa{font-size:22px;font-weight:900;margin-bottom:12px}
+.bb{background:var(--c2);border-radius:8px;padding:12px 14px;margin-bottom:10px}
+.nt{background:var(--c2);border-radius:8px;padding:10px 12px;font-size:12px;font-style:italic;line-height:1.6;margin-top:8px}
+.rl{background:rgba(255,204,0,.04);border:1px solid rgba(255,204,0,.15);border-radius:12px;padding:12px;font-size:11px;color:var(--gd);line-height:2.1}
+.er{background:rgba(255,51,85,.06);border:1px solid rgba(255,51,85,.2);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:8px}
+.ld{background:var(--card);border-radius:14px;padding:32px 20px;text-align:center;border:1px solid var(--ln)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px}
+.live{animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+.gr{color:var(--gr)}.rd{color:var(--rd)}.gd{color:var(--gd)}.ac{color:var(--acc)}
+</style></head><body>
 <div class="hdr">
-  <div class="hdr-top">
+  <div style="display:flex;justify-content:space-between;align-items:center">
     <div>
-      <div style="font-size:9px;color:var(--muted);letter-spacing:3px">NIFTY 50 LIVE DASHBOARD</div>
-      <div style="margin-top:4px">
-        <span class="spot" id="spot">—</span>
-        <span class="chg" id="chg">—</span>
-      </div>
+      <div style="font-size:9px;color:var(--mt);letter-spacing:3px;margin-bottom:2px">NIFTY 50 · ANGEL ONE LIVE API</div>
+      <div><span class="spot" id="sp">—</span></div>
     </div>
     <div style="text-align:right">
-      <div style="font-size:10px;color:var(--muted)" id="status">
-        <span class="dot" id="dot" style="background:var(--muted)"></span>
-        <span id="status-txt">Loading</span>
+      <div style="font-size:10px;color:var(--mt);margin-bottom:4px">
+        <span class="dot" id="dot" style="background:var(--mt)"></span><span id="stxt">Loading</span>
       </div>
-      <div class="ts" id="cd"></div>
-      <button class="btn" id="refBtn" onclick="refresh_()" style="margin-top:6px">↻ REFRESH</button>
+      <button class="btn" id="rb" onclick="load()">↻ REFRESH</button>
     </div>
   </div>
-  <div class="hdr-meta" id="meta">—</div>
-  <div class="ts" id="ts">—</div>
+  <div style="display:flex;gap:14px;margin-top:5px;font-size:10px;color:var(--mt)" id="hm"></div>
+  <div style="font-size:9px;color:var(--mt);margin-top:3px" id="ts"></div>
 </div>
-
-<div class="wrap" id="main" style="display:none">
-
-  <div class="disc">⚠️ Live NSE data · Refreshes every 90 sec · Verify on Angel One</div>
-
-  <!-- PCR -->
-  <div class="card">
-    <div class="lbl">PCR ANALYSIS</div>
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-      <span style="font-size:20px;font-weight:900" id="pcr-val">—</span>
-      <span style="font-size:13px;font-weight:700" id="pcr-bias">—</span>
+<div class="wrap">
+  <div class="er" id="er" style="display:none">
+    <div class="rd" id="em"></div>
+    <button class="btn" onclick="load()">↻ Retry</button>
+  </div>
+  <div class="ld" id="ld">
+    <div class="ac" style="font-size:13px;letter-spacing:2px">⏳ CONNECTING TO ANGEL ONE...</div>
+    <div style="color:var(--mt);font-size:11px;margin-top:6px">Authenticating — takes ~10 seconds</div>
+  </div>
+  <div id="main" style="display:none;flex-direction:column;gap:11px">
+    <div id="wb" style="display:none;background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.2);border-radius:8px;padding:8px 12px;font-size:10px;color:var(--gd)"></div>
+    <div class="card">
+      <div class="lbl">PCR ANALYSIS — LIVE</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:22px;font-weight:900" id="pv">—</span>
+        <span style="font-size:13px;font-weight:700" id="pb">—</span>
+      </div>
+      <div class="bw"><div class="bf" id="pbar" style="width:50%"></div></div>
+      <div class="bl"><span>0.5 BEAR</span><span>1.0 NEUTRAL</span><span>1.5+ BULL</span></div>
+      <div class="g4" style="margin-top:10px">
+        <div class="cell"><div class="cl">CALL OI</div><div class="cv rd" id="co">—</div></div>
+        <div class="cell"><div class="cl">PUT OI</div><div class="cv gr" id="po">—</div></div>
+        <div class="cell"><div class="cl">MAX PAIN</div><div class="cv gd" id="mp">—</div></div>
+        <div class="cell"><div class="cl">EXPIRY</div><div class="cv ac" id="ex">—</div></div>
+      </div>
     </div>
-    <div class="bar-wrap"><div class="bar-fill" id="pcr-bar" style="width:0%"></div></div>
-    <div class="bar-labels"><span>0.5 BEAR</span><span>1.0 NEUTRAL</span><span>1.5+ BULL</span></div>
-    <div class="grid3" style="margin-top:10px">
-      <div class="cell"><div class="l">CALL OI</div><div class="v red" id="c-oi">—</div></div>
-      <div class="cell"><div class="l">PUT OI</div><div class="v green" id="p-oi">—</div></div>
-      <div class="cell"><div class="l">MAX PAIN</div><div class="v gold" id="mp">—</div></div>
+    <div class="card">
+      <div class="lbl">STRADDLE & RANGE</div>
+      <div class="g3">
+        <div class="cell"><div class="cl">STRADDLE</div><div class="cv ac" id="str">—</div></div>
+        <div class="cell"><div class="cl">RANGE LOW</div><div class="cv rd" id="rl">—</div></div>
+        <div class="cell"><div class="cl">RANGE HIGH</div><div class="cv gr" id="rh">—</div></div>
+      </div>
     </div>
-  </div>
-
-  <!-- Straddle / Range -->
-  <div class="card">
-    <div class="lbl">STRADDLE & RANGE</div>
-    <div class="grid3">
-      <div class="cell"><div class="l">STRADDLE</div><div class="v accent" id="strd">—</div></div>
-      <div class="cell"><div class="l">RANGE LOW</div><div class="v red" id="rl">—</div></div>
-      <div class="cell"><div class="l">RANGE HIGH</div><div class="v green" id="rh">—</div></div>
+    <div class="card">
+      <div class="lbl">KEY LEVELS</div>
+      <div class="struct" id="struct">—</div>
     </div>
-  </div>
-
-  <!-- Structure -->
-  <div class="card">
-    <div class="lbl">🗺️ KEY LEVELS</div>
-    <div class="structure" id="structure">—</div>
-  </div>
-
-  <!-- Call Walls -->
-  <div class="card">
-    <div class="lbl red">🔴 CALL WALLS — Resistance</div>
-    <div id="call-walls">—</div>
-  </div>
-
-  <!-- Put Walls -->
-  <div class="card">
-    <div class="lbl green">🟢 PUT WALLS — Support</div>
-    <div id="put-walls">—</div>
-  </div>
-
-  <!-- FII -->
-  <div class="card">
-    <div class="lbl">🏦 FII / DII FLOW (previous day)</div>
-    <div id="fii-rows">—</div>
-  </div>
-
-  <!-- Signal -->
-  <div class="sig-card" id="sig-card">
-    <div class="lbl">🎯 TRADE SIGNAL</div>
-    <div class="sig-action" id="sig-action">—</div>
-    <div class="buy-cell">
-      <div class="l">STRIKE TO BUY</div>
-      <div class="v" id="buy">—</div>
+    <div class="card">
+      <div class="lbl rd">CALL WALLS — Resistance</div>
+      <div id="cw">—</div>
     </div>
-    <div class="grid2">
-      <div class="cell"><div class="l">HEDGE</div><div class="v gold" id="hedge">—</div></div>
-      <div class="cell"><div class="l">TARGET 1</div><div class="v accent" id="t1">—</div></div>
-      <div class="cell"><div class="l">TARGET 2</div><div class="v accent" id="t2">—</div></div>
-      <div class="cell"><div class="l">STOP LOSS</div><div class="v red">40% of premium</div></div>
+    <div class="card">
+      <div class="lbl gr">PUT WALLS — Support</div>
+      <div id="pw">—</div>
     </div>
-    <div class="note" id="sig-note"></div>
-  </div>
-
-  <!-- Expiry -->
-  <div class="card">
-    <div class="lbl">📅 EXPIRY</div>
-    <div class="grid2">
-      <div class="cell"><div class="l">CURRENT WEEK</div><div class="v accent" id="exp0">—</div></div>
-      <div class="cell"><div class="l">NEXT WEEK</div><div class="v" style="color:var(--muted)" id="exp1">—</div></div>
+    <div class="sig" id="sc">
+      <div class="lbl">TRADE SIGNAL</div>
+      <div class="sa" id="sa">—</div>
+      <div class="bb">
+        <div style="color:var(--mt);font-size:8px;letter-spacing:1px;margin-bottom:4px">STRIKE TO BUY</div>
+        <div style="font-size:15px;font-weight:700" id="sb">—</div>
+      </div>
+      <div class="g2">
+        <div class="cell"><div class="cl">HEDGE</div><div class="cv gd" id="sh">—</div></div>
+        <div class="cell"><div class="cl">TARGET 1</div><div class="cv ac" id="t1">—</div></div>
+        <div class="cell"><div class="cl">TARGET 2</div><div class="cv ac" id="t2">—</div></div>
+        <div class="cell"><div class="cl">STOP LOSS</div><div class="cv rd">40% premium</div></div>
+      </div>
+      <div class="nt" id="nt"></div>
     </div>
-  </div>
-
-  <!-- Rules -->
-  <div class="rules">
-    ⚠️ Wait for 9:30 AM candle confirmation<br>
-    ⚠️ 1-2 lots MAX | SL = 40% of premium<br>
-    ⚠️ Always buy hedge on every trade<br>
-    ⚠️ Lot size = 65 | Verify levels on Angel One
-  </div>
-
-</div>
-
-<!-- Error -->
-<div class="wrap" id="err-div" style="display:none">
-  <div class="err">
-    <div class="red" id="err-msg" style="margin-bottom:8px">—</div>
-    <button class="btn" onclick="refresh_()">Retry</button>
-  </div>
-</div>
-
-<!-- Loading -->
-<div class="wrap" id="load-div">
-  <div class="card" style="text-align:center;padding:40px 20px">
-    <div class="accent" style="font-size:13px;letter-spacing:2px">
-      <span class="spin">⏳</span> FETCHING LIVE NSE DATA
-    </div>
-    <div style="color:var(--muted);font-size:11px;margin-top:8px">
-      Connecting to NSE... (~10 seconds)
+    <div class="rl">
+      Wait for 9:30 AM candle · 1-2 lots MAX<br>
+      SL = 40% of premium · Always buy hedge<br>
+      Lot size = 65 · This is analysis, not advice
     </div>
   </div>
 </div>
-
 <script>
-let countdown = 90;
-
-function fmt(n){ return typeof n==="number"? n.toLocaleString("en-IN",{minimumFractionDigits:2}):String(n||"—"); }
-function fmtI(n){ return typeof n==="number"? n.toLocaleString("en-IN"):String(n||"—"); }
-function colClass(v){ return v>=1?"green":v>=0.9?"gold":"red"; }
-function sigColor(c){ return c==="green"?"var(--green)":c==="red"?"var(--red)":"var(--gold)"; }
-
-function oiBar(walls, isCall){
-  const maxOi = Math.max(...walls.map(w=>w.oi), 1);
+let cd=120;
+const fi=(n,d=2)=>typeof n==='number'?n.toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d}):String(n||'—');
+const fii=n=>typeof n==='number'?n.toLocaleString('en-IN'):String(n||'—');
+function oiBar(walls,col){
+  if(!walls||!walls.length)return'<div style="color:var(--mt);font-size:12px">No OI data</div>';
+  const mx=Math.max(...walls.map(w=>parseFloat(w.oi)||1),1);
   return walls.map(w=>{
-    const pct = Math.min(w.oi/maxOi*100, 100);
-    const chgTxt = w.chg>=0 ? `+${w.chg.toFixed(0)}L` : `${w.chg.toFixed(0)}L`;
-    const col = isCall ? "var(--red)" : "var(--green)";
-    return `<div class="oi-bar-wrap">
-      <div class="oi-bar-row">
-        <span style="color:var(--white);font-weight:700;font-size:12px">${fmtI(w.s)} ${isCall?"CE":"PE"}</span>
-        <span style="font-size:11px;color:${col}">${w.oi.toFixed(1)}Cr &nbsp;${chgTxt}</span>
-      </div>
-      <div class="oi-bar-bg"><div class="oi-bar-fill" style="width:${pct}%;background:${col}"></div></div>
-    </div>`;
-  }).join("");
+    const pct=Math.min((parseFloat(w.oi)||0)/mx*100,100);
+    return`<div class="oib"><div class="or">
+      <span style="color:var(--wh);font-weight:700">${fii(w.s)} ${col.includes('rd')||col.includes('ff3')?'CE':'PE'}</span>
+      <span style="color:${col}">${w.oi}Cr</span>
+    </div><div class="obg"><div class="ofl" style="width:${pct}%;background:${col}"></div></div></div>`;
+  }).join('');
 }
-
 function render(d){
-  if(!d.ok){ showErr(d.error); return; }
-
-  document.getElementById("spot").textContent = fmt(d.spot);
-  const chgEl = document.getElementById("chg");
-
-  // Derive change from prev close if available
-  chgEl.textContent = "";
-
-  document.getElementById("meta").innerHTML =
-    `H:${fmtI(d.spot+50)} &nbsp; L:${fmtI(d.spot-50)} &nbsp; ATM:${fmtI(d.atm)} &nbsp; VWAP:≈${fmtI(Math.round(d.spot*0.997))}`;
-  document.getElementById("ts").textContent = "Updated: "+d.ts;
-
-  // PCR
-  const pcrEl = document.getElementById("pcr-val");
-  pcrEl.textContent = d.pcr_all;
-  pcrEl.className = "v "+ colClass(d.pcr_all);
-  const biasEl = document.getElementById("pcr-bias");
-  biasEl.textContent = d.bias;
-  biasEl.style.color = sigColor(d.sig_color);
-  document.getElementById("pcr-bar").style.width = Math.min(d.pcr_all/2*100,100)+"%";
-
-  document.getElementById("c-oi").textContent = d.c_oi_cr+"Cr";
-  document.getElementById("p-oi").textContent = d.p_oi_cr+"Cr";
-  document.getElementById("mp").textContent = fmtI(d.max_pain);
-  document.getElementById("strd").textContent = "₹"+d.straddle;
-  document.getElementById("rl").textContent = fmtI(d.range_low);
-  document.getElementById("rh").textContent = fmtI(d.range_high);
-
-  // Structure
-  const cw1 = d.calls[0]?.s, pw1 = d.puts[0]?.s;
-  const cw2 = d.calls[1]?.s;
-  document.getElementById("structure").innerHTML = `
-    <div class="red">${cw2?`🔴 ${fmtI(cw2)} CE &nbsp;←&nbsp; Upper wall<br>`:""}
-    🔴 <strong>${fmtI(cw1)} CE &nbsp;←&nbsp; NEAREST CEILING</strong></div>
-    <div style="color:var(--line)">${"─".repeat(30)}</div>
-    <div class="accent" style="font-size:15px;font-weight:900">📍 ${fmt(d.spot)} &nbsp; ATM ${fmtI(d.atm)}</div>
-    <div style="color:var(--line)">${"─".repeat(30)}</div>
-    <div class="green"><strong>🟢 ${fmtI(pw1)} PE &nbsp;←&nbsp; NEAREST FLOOR</strong></div>
-    <div class="gold">🎯 Max Pain: ${fmtI(d.max_pain)}</div>
-    <div style="color:var(--muted)">📐 Range: ${fmtI(d.range_low)} – ${fmtI(d.range_high)}</div>`;
-
-  // OI walls
-  document.getElementById("call-walls").innerHTML = oiBar(d.calls, true);
-  document.getElementById("put-walls").innerHTML  = oiBar(d.puts,  false);
-
-  // FII
-  document.getElementById("fii-rows").innerHTML = d.fii.length ?
-    d.fii.map(f=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px">
-      <span>${f.name}</span>
-      <span style="color:var(--${f.color});font-weight:700">${f.net>=0?"+":""}${parseFloat(f.net||0).toLocaleString("en-IN",{maximumFractionDigits:2})} Cr</span>
-    </div>`).join("") : "<div style='color:var(--muted);font-size:12px'>FII data unavailable</div>";
-
-  // Signal
-  const sc = sigColor(d.sig_color);
-  const sigCard = document.getElementById("sig-card");
-  sigCard.style.borderColor = sc.replace(")",",0.3)").replace("var(","rgba(").replace(")","");
-  sigCard.style.background  = sc.replace(")",",0.06)").replace("var(","rgba(").replace(")","");
-  const icon = d.sig_color==="green"?"🟢":d.sig_color==="red"?"🔴":"🟡";
-  document.getElementById("sig-action").innerHTML = `<span style="color:${sc}">${icon} ${d.signal}</span>`;
-  const buyEl = document.getElementById("buy");
-  buyEl.textContent = d.buy;
-  buyEl.style.color = sc;
-  document.getElementById("hedge").textContent = d.hedge;
-  document.getElementById("t1").textContent = fmtI(d.t1);
-  document.getElementById("t2").textContent = fmtI(d.t2);
-  document.getElementById("sig-note").textContent =
-    d.signal==="WAIT" ? "⏳ Momentum unclear. Wait for 9:30 AM candle." :
-    d.signal==="BUY CALL" ? `⬆️ Bullish bias. Call walls at ${fmtI(d.calls[0]?.s)}. Use put wall ${fmtI(d.puts[0]?.s)} as SL reference.` :
-    `⬇️ Bearish bias. Put floor at ${fmtI(d.puts[0]?.s)}. Use call wall ${fmtI(d.calls[0]?.s)} as SL reference.`;
-
-  document.getElementById("exp0").textContent = d.exp0 || "—";
-  document.getElementById("exp1").textContent = d.exp1 || "—";
-
-  // Status
-  document.getElementById("dot").className = "dot live-dot";
-  document.getElementById("status-txt").textContent = "LIVE";
-
-  document.getElementById("load-div").style.display = "none";
-  document.getElementById("err-div").style.display  = "none";
-  document.getElementById("main").style.display     = "flex";
-
-  countdown = 90;
+  if(!d.ok){
+    document.getElementById('ld').style.display='none';
+    document.getElementById('er').style.display='flex';
+    document.getElementById('em').textContent='Error: '+(d.error||'Unknown');
+    return;
+  }
+  document.getElementById('sp').textContent=fi(d.spot);
+  document.getElementById('hm').innerHTML=`ATM:${fii(d.atm)} &nbsp; Straddle:₹${d.straddle} &nbsp; Expiry:${d.expiry}`;
+  document.getElementById('ts').textContent='Updated: '+d.ts;
+  if(d.warning||!d.chain_live){
+    const wb=document.getElementById('wb');
+    wb.style.display='block';
+    wb.textContent=d.warning||(d.chain_live?'':'⚠️ OI chain unavailable — using estimated levels from spot');
+  }
+  const sc=d.sig_color,col=sc==='green'?'var(--gr)':sc==='red'?'var(--rd)':'var(--gd)';
+  const pv=document.getElementById('pv');pv.textContent=d.pcr_all;pv.style.color=col;
+  const pb=document.getElementById('pb');pb.textContent=d.bias;pb.style.color=col;
+  document.getElementById('pbar').style.width=Math.min(d.pcr_all/2*100,100)+'%';
+  document.getElementById('co').textContent=d.c_oi_cr?d.c_oi_cr+'Cr':'—';
+  document.getElementById('po').textContent=d.p_oi_cr?d.p_oi_cr+'Cr':'—';
+  document.getElementById('mp').textContent=fii(d.max_pain);
+  document.getElementById('ex').textContent=d.expiry||'—';
+  document.getElementById('str').textContent='₹'+d.straddle;
+  document.getElementById('rl').textContent=fii(d.range_low);
+  document.getElementById('rh').textContent=fii(d.range_high);
+  const c1=d.calls[0]?.s,p1=d.puts[0]?.s;
+  document.getElementById('struct').innerHTML=`
+    <div class="rd">🔴 ${fii((c1||0)+500)} CE ← Upper wall<br><strong>🔴 ${fii(c1)} CE ← CEILING</strong></div>
+    <div style="color:var(--ln)">${'─'.repeat(28)}</div>
+    <div class="ac" style="font-size:15px;font-weight:900">📍 ${fi(d.spot)} &nbsp; ATM ${fii(d.atm)}</div>
+    <div style="color:var(--ln)">${'─'.repeat(28)}</div>
+    <div class="gr"><strong>🟢 ${fii(p1)} PE ← FLOOR</strong><br>🟢 ${fii((p1||0)-500)} PE ← Deep floor</div>
+    <div class="gd">🎯 Max Pain: ${fii(d.max_pain)}</div>
+    <div style="color:var(--mt)">📐 Range: ${fii(d.range_low)} – ${fii(d.range_high)}</div>`;
+  const crCol='var(--rd)',prCol='var(--gr)';
+  document.getElementById('cw').innerHTML=oiBar(d.calls,crCol);
+  document.getElementById('pw').innerHTML=oiBar(d.puts,prCol);
+  const brd=sc==='green'?'rgba(0,255,136,.3)':sc==='red'?'rgba(255,51,85,.3)':'rgba(255,204,0,.3)';
+  const bg=sc==='green'?'rgba(0,255,136,.05)':sc==='red'?'rgba(255,51,85,.05)':'rgba(255,204,0,.05)';
+  const sigC=document.getElementById('sc');sigC.style.borderColor=brd;sigC.style.background=bg;
+  const icon=sc==='green'?'🟢':sc==='red'?'🔴':'🟡';
+  document.getElementById('sa').innerHTML=`<span style="color:${col}">${icon} ${d.signal}</span>`;
+  const sb=document.getElementById('sb');sb.textContent=d.buy;sb.style.color=col;
+  document.getElementById('sh').textContent=d.hedge;
+  document.getElementById('t1').textContent=fii(d.t1);
+  document.getElementById('t2').textContent=fii(d.t2);
+  document.getElementById('nt').textContent=d.note;
+  document.getElementById('dot').style.background='var(--gr)';
+  document.getElementById('dot').className='dot live';
+  document.getElementById('stxt').textContent='LIVE';
+  document.getElementById('ld').style.display='none';
+  document.getElementById('er').style.display='none';
+  document.getElementById('main').style.display='flex';
+  cd=120;
 }
-
-function showErr(msg){
-  document.getElementById("load-div").style.display = "none";
-  document.getElementById("main").style.display     = "none";
-  document.getElementById("err-div").style.display  = "flex";
-  document.getElementById("err-msg").textContent = "⚠️ " + msg;
-  document.getElementById("dot").className = "dot";
-  document.getElementById("dot").style.background = "var(--red)";
-  document.getElementById("status-txt").textContent = "ERROR";
-}
-
-async function refresh_(){
-  document.getElementById("refBtn").disabled = true;
-  document.getElementById("status-txt").textContent = "Refreshing...";
+async function load(){
+  document.getElementById('rb').disabled=true;
+  document.getElementById('stxt').textContent='Fetching...';
   try{
-    const r = await fetch("/api/data");
-    const d = await r.json();
-    render(d);
-  }catch(e){ showErr(e.message); }
-  finally{ document.getElementById("refBtn").disabled = false; }
+    const r=await fetch('/api/data');
+    render(await r.json());
+  }catch(e){
+    document.getElementById('er').style.display='flex';
+    document.getElementById('em').textContent='Network error: '+e.message;
+  }finally{document.getElementById('rb').disabled=false;}
 }
-
-// Countdown timer
-setInterval(()=>{
-  countdown--;
-  const m = Math.floor(countdown/60);
-  const s = String(countdown%60).padStart(2,"0");
-  document.getElementById("cd").textContent = `↻ Auto-refresh in ${m}:${s}`;
-  if(countdown <= 0){ refresh_(); }
-}, 1000);
-
-// Initial load
-refresh_();
-</script>
-</body>
-</html>"""
+setInterval(()=>{cd--;if(cd<=0)load();},1000);
+load();
+</script></body></html>"""
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
