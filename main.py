@@ -1,7 +1,6 @@
-import os, time, pyotp
+import os, time, pyotp, requests
 from flask import Flask, jsonify, render_template_string
 from datetime import datetime, date, timedelta
-from SmartApi import SmartConnect
 
 app = Flask(__name__)
 
@@ -9,54 +8,107 @@ API_KEY     = os.environ.get("ANGEL_API_KEY", "")
 CLIENT_CODE = os.environ.get("ANGEL_CLIENT_CODE", "")
 ANGEL_PIN   = os.environ.get("ANGEL_PIN", "")
 TOTP_SECRET = os.environ.get("ANGEL_TOTP_SECRET", "")
+BASE        = "https://apiconnect.angelbroking.com"
+_cache      = {"data": None, "ts": 0, "jwt": None, "jwt_ts": 0}
+CACHE_TTL   = 120
 
-_cache = {"data": None, "ts": 0, "obj": None, "obj_ts": 0}
-CACHE_TTL = 120
+# ── Angel One Auth ─────────────────────────────────────────────
+def base_headers(jwt=None):
+    h = {
+        "Content-Type":     "application/json",
+        "Accept":           "application/json",
+        "X-UserType":       "USER",
+        "X-SourceID":       "WEB",
+        "X-ClientLocalIP":  "127.0.0.1",
+        "X-ClientPublicIP": "106.193.147.98",
+        "X-MACAddress":     "fe80::216e:6507:4b90:3719",
+        "X-PrivateKey":     API_KEY,
+    }
+    if jwt:
+        h["Authorization"] = f"Bearer {jwt}"
+    return h
 
-# ── Angel One Session ──────────────────────────────────────────
-def get_obj():
-    """Get authenticated SmartConnect object (cached 50 min)"""
-    if _cache["obj"] and time.time() - _cache["obj_ts"] < 3000:
-        return _cache["obj"]
-    obj  = SmartConnect(api_key=API_KEY)
+def login():
+    """Try multiple param-name variations to handle API version differences"""
+    if _cache["jwt"] and time.time() - _cache["jwt_ts"] < 3000:
+        return _cache["jwt"]
+
     totp = pyotp.TOTP(TOTP_SECRET).now()
-    data = obj.generateSession(CLIENT_CODE, ANGEL_PIN, totp)
-    if not data.get("status"):
-        raise Exception(f"Login failed: {data.get('message','Unknown')} | {data}")
-    _cache["obj"]    = obj
-    _cache["obj_ts"] = time.time()
-    return obj
+    url  = f"{BASE}/rest/auth/angelbroking/user/v1/loginByPassword"
 
-# ── Data Fetchers ──────────────────────────────────────────────
-def get_spot(obj):
-    q = obj.ltpData("NSE", "Nifty 50", "99926000")
-    if q.get("status") and q.get("data"):
-        return float(q["data"]["ltp"])
-    # Fallback token
-    q2 = obj.ltpData("NSE", "NIFTY", "26000")
-    if q2.get("status") and q2.get("data"):
-        return float(q2["data"]["ltp"])
-    raise Exception(f"Spot failed: {q}")
+    # Try different param names - Angel One changed these across versions
+    payloads = [
+        {"clientcode": CLIENT_CODE, "password": ANGEL_PIN, "totp": totp},
+        {"clientCode": CLIENT_CODE, "password": ANGEL_PIN, "totp": totp},
+        {"userId":     CLIENT_CODE, "password": ANGEL_PIN, "totp": totp},
+        {"userName":   CLIENT_CODE, "password": ANGEL_PIN, "totp": totp},
+    ]
+
+    last_err = ""
+    for payload in payloads:
+        try:
+            r = requests.post(url, json=payload,
+                              headers=base_headers(), timeout=15)
+            d = r.json()
+            if d.get("status") and d.get("data", {}).get("jwtToken"):
+                _cache["jwt"]    = d["data"]["jwtToken"]
+                _cache["jwt_ts"] = time.time()
+                return _cache["jwt"]
+            last_err = d.get("message", str(d))
+        except Exception as e:
+            last_err = str(e)
+
+    raise Exception(f"All login attempts failed. Last error: {last_err}")
+
+# ── Market Data ────────────────────────────────────────────────
+def get_spot(jwt):
+    """Get NIFTY 50 spot — tries multiple tokens"""
+    tokens = [
+        ("NSE", "99926000", "Nifty 50"),
+        ("NSE", "26000",    "NIFTY"),
+        ("NSE", "26074",    "NIFTY"),
+    ]
+    for exch, token, sym in tokens:
+        try:
+            r = requests.post(
+                f"{BASE}/rest/secure/angelbroking/market/v1/quote/",
+                json={"mode": "LTP", "exchangeTokens": {exch: [token]}},
+                headers=base_headers(jwt), timeout=10)
+            d = r.json()
+            fetched = (d.get("data") or {}).get("fetched", [])
+            if fetched and fetched[0].get("ltp"):
+                return float(fetched[0]["ltp"])
+        except Exception:
+            continue
+    raise Exception("Could not get NIFTY spot from any token")
 
 def next_thursday():
     today = date.today()
     days  = (3 - today.weekday()) % 7
-    if days == 0:
-        now = datetime.now()
-        if now.hour >= 15 and now.minute >= 30:
-            days = 7
+    if days == 0 and datetime.now().hour >= 15:
+        days = 7
     return (today + timedelta(days=days)).strftime("%d%b%Y").upper()
 
-def get_option_chain(obj, expiry):
-    try:
-        # Angel One option chain endpoint
-        data = obj.optionChain("NIFTY", expiry, "0", "OPTIDX")
-        if data.get("status") and data.get("data"):
-            return data["data"]
-    except Exception:
-        pass
+def get_chain(jwt, expiry):
+    """Try Angel One option chain endpoints"""
+    endpoints = [
+        (f"{BASE}/rest/secure/angelbroking/marketData/v1/optionChain",
+         {"name": "NIFTY", "expirydate": expiry}),
+        (f"{BASE}/rest/secure/angelbroking/marketData/v1/optionChain",
+         {"name": "NIFTY", "expirydate": expiry, "exchange": "NFO"}),
+    ]
+    for url, body in endpoints:
+        try:
+            r = requests.post(url, json=body,
+                              headers=base_headers(jwt), timeout=15)
+            d = r.json()
+            if d.get("data"):
+                return d["data"]
+        except Exception:
+            continue
     return None
 
+# ── Analysis ───────────────────────────────────────────────────
 def pcr_signal(p):
     if p >= 1.4: return "STRONGLY BULLISH", "BUY CALL", "green"
     if p >= 1.2: return "BULLISH",          "BUY CALL", "green"
@@ -66,60 +118,49 @@ def pcr_signal(p):
     if p >= 0.6: return "BEARISH",           "BUY PUT",  "red"
     return               "STRONGLY BEARISH", "BUY PUT",  "red"
 
-# ── Core Analysis ──────────────────────────────────────────────
 def analyse():
-    obj    = get_obj()
-    spot   = get_spot(obj)
+    jwt    = login()
+    spot   = get_spot(jwt)
     atm    = round(spot / 50) * 50
     expiry = next_thursday()
-    chain  = get_option_chain(obj, expiry)
-    chain_live = False
+    chain  = get_chain(jwt, expiry)
 
     if chain:
-        chain_live = True
-        call_oi, put_oi = {}, {}
+        co, po = {}, {}
         for row in chain:
-            sp = row.get("strikePrice", row.get("strike", 0))
+            sp = row.get("strikePrice") or row.get("strike", 0)
             try: sp = int(float(sp))
             except: continue
             ce = row.get("CE") or {}
             pe = row.get("PE") or {}
-            coi = (ce.get("openInterest", 0) if isinstance(ce, dict)
-                   else row.get("CE_openInterest", 0) or row.get("callOI", 0))
-            poi = (pe.get("openInterest", 0) if isinstance(pe, dict)
-                   else row.get("PE_openInterest", 0) or row.get("putOI", 0))
-            try: call_oi[sp] = int(coi)
+            coi = ce.get("openInterest", 0) if isinstance(ce, dict) else row.get("CE_openInterest", row.get("callOI", 0))
+            poi = pe.get("openInterest", 0) if isinstance(pe, dict) else row.get("PE_openInterest", row.get("putOI", 0))
+            try: co[sp] = int(coi)
             except: pass
-            try: put_oi[sp]  = int(poi)
+            try: po[sp] = int(poi)
             except: pass
 
-        tot_c = sum(call_oi.values())
-        tot_p = sum(put_oi.values())
-        pcr   = round(tot_p / tot_c, 2) if tot_c > 0 else 1.0
-        calls = sorted([(s,o) for s,o in call_oi.items() if s >  spot], key=lambda x:-x[1])[:5]
-        puts  = sorted([(s,o) for s,o in put_oi.items()  if s <= spot], key=lambda x:-x[1])[:5]
-        cw1   = calls[0][0] if calls else int(round(spot/500+.5)*500)
-        pw1   = puts[0][0]  if puts  else int(round(spot/500-.5)*500)
+        tc = sum(co.values()); tp = sum(po.values())
+        pcr = round(tp/tc, 2) if tc else 1.0
+        calls = sorted([(s,o) for s,o in co.items() if s >  spot], key=lambda x:-x[1])[:5]
+        puts  = sorted([(s,o) for s,o in po.items() if s <= spot], key=lambda x:-x[1])[:5]
+        cw1 = calls[0][0] if calls else int(round(spot/500+.5)*500)
+        pw1 = puts[0][0]  if puts  else int(round(spot/500-.5)*500)
         call_list = [{"s":s,"oi":round(o/100000,1)} for s,o in calls[:4]]
         put_list  = [{"s":s,"oi":round(o/100000,1)} for s,o in puts[:4]]
-        c_cr  = round(tot_c/10000000, 2)
-        p_cr  = round(tot_p/10000000, 2)
-        mp    = atm
+        c_cr = round(tc/10000000, 2); p_cr = round(tp/10000000, 2)
+        mp = atm
         try:
-            strikes = sorted(set(list(call_oi)+list(put_oi)))
+            sks = sorted(set(list(co)+list(po)))
             best = float("inf")
-            for s in strikes:
-                loss = (sum(max(0,s-k)*v for k,v in call_oi.items()) +
-                        sum(max(0,k-s)*v for k,v in put_oi.items()))
-                if loss < best:
-                    best, mp = loss, s
+            for s in sks:
+                loss = sum(max(0,s-k)*v for k,v in co.items()) + sum(max(0,k-s)*v for k,v in po.items())
+                if loss < best: best, mp = loss, s
         except: pass
+        live = True
     else:
-        pcr  = 1.0
-        cw1  = int(round(spot/500+.5)*500)
-        pw1  = int(round(spot/500-.5)*500)
-        mp   = atm
-        c_cr = p_cr = 0.0
+        pcr  = 1.0; cw1 = int(round(spot/500+.5)*500); pw1 = int(round(spot/500-.5)*500)
+        mp   = atm;  c_cr = p_cr = 0.0; live = False
         call_list = [{"s":cw1,"oi":"--"},{"s":cw1+500,"oi":"--"}]
         put_list  = [{"s":pw1,"oi":"--"},{"s":pw1-500,"oi":"--"}]
 
@@ -127,50 +168,35 @@ def analyse():
     straddle = int(round(spot * 0.20 * (5/252)**0.5 / 50) * 50)
 
     if "CALL" in sig:
-        buy   = f"{atm+50} CE  or  {atm+100} CE"
-        hedge = f"{atm-200} PE"
-        t1, t2 = cw1, cw1+100
-        note  = f"Bullish (PCR {pcr}). Put floor at {pw1}. Call ceiling {cw1} = target."
+        buy=f"{atm+50} CE  or  {atm+100} CE"; hedge=f"{atm-200} PE"; t1,t2=cw1,cw1+100
+        note=f"Bullish (PCR {pcr}). Floor at {pw1}. Call wall {cw1} = target."
     elif "PUT" in sig:
-        buy   = f"{atm-50} PE  or  {atm-100} PE"
-        hedge = f"{atm+200} CE"
-        t1, t2 = pw1, pw1-100
-        note  = f"Bearish (PCR {pcr}). Call wall {cw1} capping. Put floor {pw1} = target."
+        buy=f"{atm-50} PE  or  {atm-100} PE"; hedge=f"{atm+200} CE"; t1,t2=pw1,pw1-100
+        note=f"Bearish (PCR {pcr}). Call wall {cw1} capping. Put wall {pw1} = target."
     else:
-        buy   = "Wait — confirm 9:30 AM candle direction"
-        hedge = "—"
-        t1, t2 = cw1, pw1
-        note  = f"Neutral (PCR {pcr}). Wait 9:30 candle — Bull: {atm+50}CE | Bear: {atm-50}PE"
+        buy="Wait — confirm 9:30 AM candle"; hedge="—"; t1,t2=cw1,pw1
+        note=f"Neutral (PCR {pcr}). Wait 9:30 candle — Bull:{atm+50}CE | Bear:{atm-50}PE"
 
-    return {
-        "ok": True, "spot": spot, "atm": atm, "expiry": expiry,
-        "pcr_all": pcr, "c_oi_cr": c_cr, "p_oi_cr": p_cr,
-        "max_pain": mp, "straddle": straddle,
-        "range_low": round(spot-straddle), "range_high": round(spot+straddle),
-        "bias": bias, "signal": sig, "sig_color": sc,
-        "buy": buy, "hedge": hedge, "t1": t1, "t2": t2,
-        "calls": call_list, "puts": put_list, "note": note,
-        "chain_live": chain_live,
-        "ts": datetime.now().strftime("%d %b %Y  %I:%M:%S %p"),
-    }
+    return {"ok":True,"spot":spot,"atm":atm,"expiry":expiry,"pcr_all":pcr,
+            "c_oi_cr":c_cr,"p_oi_cr":p_cr,"max_pain":mp,"straddle":straddle,
+            "range_low":round(spot-straddle),"range_high":round(spot+straddle),
+            "bias":bias,"signal":sig,"sig_color":sc,"buy":buy,"hedge":hedge,
+            "t1":t1,"t2":t2,"calls":call_list,"puts":put_list,"note":note,
+            "chain_live":live,"ts":datetime.now().strftime("%d %b %Y  %I:%M:%S %p")}
 
 # ── Routes ─────────────────────────────────────────────────────
 @app.route("/api/data")
 def api_data():
-    if _cache["data"] and time.time() - _cache["ts"] < CACHE_TTL:
+    if _cache["data"] and time.time()-_cache["ts"] < CACHE_TTL:
         return jsonify(_cache["data"])
     try:
         d = analyse()
-        _cache["data"] = d
-        _cache["ts"]   = time.time()
+        _cache["data"]=d; _cache["ts"]=time.time()
         return jsonify(d)
     except Exception as e:
         if _cache["data"]:
-            s = dict(_cache["data"])
-            s["warning"] = f"Stale cache — {e}"
-            return jsonify(s)
-        return jsonify({"ok": False, "error": str(e),
-                        "ts": datetime.now().strftime("%I:%M:%S %p")})
+            s=dict(_cache["data"]); s["warning"]=f"Stale — {e}"; return jsonify(s)
+        return jsonify({"ok":False,"error":str(e),"ts":datetime.now().strftime("%I:%M:%S %p")})
 
 @app.route("/")
 def index():
@@ -185,11 +211,9 @@ HTML = """<!DOCTYPE html>
   --acc:#00d4ff;--gr:#00ff88;--rd:#ff3355;--gd:#ffcc00;--mt:#2a4060;--tx:#7aaac8;--wh:#e8f8ff}
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;min-height:100vh;padding-bottom:50px}
-.hdr{background:linear-gradient(180deg,#0a1828,#04090f);border-bottom:1px solid var(--ln);
-  padding:12px 14px;position:sticky;top:0;z-index:20}
+.hdr{background:linear-gradient(180deg,#0a1828,#04090f);border-bottom:1px solid var(--ln);padding:12px 14px;position:sticky;top:0;z-index:20}
 .spot{font-size:26px;font-weight:900;color:var(--wh)}
-.btn{background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.3);border-radius:8px;
-  padding:7px 13px;color:var(--acc);font-size:11px;font-family:inherit;cursor:pointer;letter-spacing:1px}
+.btn{background:rgba(0,212,255,.12);border:1px solid rgba(0,212,255,.3);border-radius:8px;padding:7px 13px;color:var(--acc);font-size:11px;font-family:inherit;cursor:pointer;letter-spacing:1px}
 .wrap{padding:12px 14px;display:flex;flex-direction:column;gap:11px}
 .card{background:var(--card);border-radius:14px;padding:14px;border:1px solid var(--ln)}
 .lbl{font-size:9px;color:var(--mt);letter-spacing:3px;margin-bottom:10px}
@@ -228,7 +252,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;mi
       <div style="font-size:10px;color:var(--mt);margin-bottom:4px">
         <span class="dot" id="dot" style="background:var(--mt)"></span><span id="stxt">Loading</span>
       </div>
-      <button class="btn" id="rb" onclick="load()">↻ REFRESH</button>
+      <button class="btn" id="rb" onclick="load()">&#8635; REFRESH</button>
     </div>
   </div>
   <div style="display:flex;gap:14px;margin-top:5px;font-size:10px;color:var(--mt)" id="hm"></div>
@@ -237,16 +261,16 @@ body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;mi
 <div class="wrap">
   <div class="er" id="er" style="display:none">
     <div class="rd" id="em"></div>
-    <button class="btn" onclick="load()">↻ Retry</button>
+    <button class="btn" onclick="load()">&#8635; Retry</button>
   </div>
   <div class="ld" id="ld">
-    <div class="ac" style="font-size:13px;letter-spacing:2px">⏳ CONNECTING TO ANGEL ONE...</div>
-    <div style="color:var(--mt);font-size:11px;margin-top:6px">Authenticating — ~10 seconds</div>
+    <div class="ac" style="font-size:13px;letter-spacing:2px">&#9203; CONNECTING TO ANGEL ONE...</div>
+    <div style="color:var(--mt);font-size:11px;margin-top:6px">Authenticating — ~10 seconds first load</div>
   </div>
   <div id="mn" style="display:none;flex-direction:column;gap:11px">
     <div id="wb" style="display:none;background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.2);border-radius:8px;padding:8px 12px;font-size:10px;color:var(--gd)"></div>
     <div class="card">
-      <div class="lbl">PCR — ANGEL ONE LIVE DATA</div>
+      <div class="lbl">PCR ANALYSIS &#183; ANGEL ONE LIVE</div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
         <span style="font-size:22px;font-weight:900" id="pv">—</span>
         <span style="font-size:13px;font-weight:700" id="pb">—</span>
@@ -261,7 +285,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;mi
       </div>
     </div>
     <div class="card">
-      <div class="lbl">STRADDLE & RANGE</div>
+      <div class="lbl">STRADDLE &amp; RANGE</div>
       <div class="g3">
         <div class="cell"><div class="cl">STRADDLE</div><div class="cv ac" id="str">—</div></div>
         <div class="cell"><div class="cl">RANGE LOW</div><div class="cv rd" id="rl">—</div></div>
@@ -269,13 +293,13 @@ body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;mi
       </div>
     </div>
     <div class="card">
-      <div class="lbl">KEY LEVELS</div>
+      <div class="lbl">&#128205; KEY LEVELS</div>
       <div class="struct" id="struct">—</div>
     </div>
-    <div class="card"><div class="lbl rd">CALL WALLS — Resistance</div><div id="cw">—</div></div>
-    <div class="card"><div class="lbl gr">PUT WALLS — Support</div><div id="pw">—</div></div>
+    <div class="card"><div class="lbl rd">&#128308; CALL WALLS &#183; Resistance</div><div id="cw">—</div></div>
+    <div class="card"><div class="lbl gr">&#128994; PUT WALLS &#183; Support</div><div id="pw">—</div></div>
     <div class="sig" id="sc">
-      <div class="lbl">TRADE SIGNAL</div>
+      <div class="lbl">&#127919; TRADE SIGNAL</div>
       <div class="sa" id="sa">—</div>
       <div class="bb">
         <div style="color:var(--mt);font-size:8px;letter-spacing:1px;margin-bottom:4px">STRIKE TO BUY</div>
@@ -289,7 +313,7 @@ body{background:var(--bg);color:var(--tx);font-family:'Courier New',monospace;mi
       </div>
       <div class="nt" id="nt"></div>
     </div>
-    <div class="rl">Wait for 9:30 AM candle · 1-2 lots MAX · SL = 40% · Always hedge · Lot size = 65</div>
+    <div class="rl">Wait 9:30 candle &#183; 1-2 lots MAX &#183; SL=40% &#183; Always hedge &#183; Lot=65</div>
   </div>
 </div>
 <script>
@@ -298,8 +322,7 @@ const fi=(n,d=2)=>typeof n==='number'?n.toLocaleString('en-IN',{minimumFractionD
 const fii=n=>typeof n==='number'?n.toLocaleString('en-IN'):String(n||'—');
 function oiBar(walls,isCall){
   if(!walls||!walls.length)return'<div style="color:var(--mt);font-size:12px">No OI data</div>';
-  const col=isCall?'var(--rd)':'var(--gr)';
-  const mx=Math.max(...walls.map(w=>parseFloat(w.oi)||1),1);
+  const col=isCall?'var(--rd)':'var(--gr)',mx=Math.max(...walls.map(w=>parseFloat(w.oi)||1),1);
   return walls.map(w=>`<div class="oib"><div class="or">
     <span style="color:var(--wh);font-weight:700">${fii(w.s)} ${isCall?'CE':'PE'}</span>
     <span style="color:${col}">${w.oi}Cr</span>
@@ -309,20 +332,17 @@ function render(d){
   if(!d.ok){
     document.getElementById('ld').style.display='none';
     document.getElementById('er').style.display='flex';
-    document.getElementById('em').textContent='Error: '+(d.error||'Unknown');
-    return;
+    document.getElementById('em').textContent='Error: '+(d.error||'Unknown');return;
   }
   document.getElementById('sp').textContent=fi(d.spot);
   document.getElementById('hm').innerHTML=`ATM:${fii(d.atm)} &nbsp; Straddle:&#8377;${d.straddle} &nbsp; Expiry:${d.expiry}`;
   document.getElementById('ts').textContent='Updated: '+d.ts;
   const wb=document.getElementById('wb');
-  if(d.warning||!d.chain_live){
-    wb.style.display='block';
-    wb.textContent=d.warning||(d.chain_live?'':'&#9888;&#65039; OI chain unavailable — using estimated levels');
-  }else{wb.style.display='none';}
+  if(d.warning||!d.chain_live){wb.style.display='block';wb.textContent=d.warning||'&#9888; OI chain unavailable — estimated levels';}
+  else wb.style.display='none';
   const sc=d.sig_color,col=sc==='green'?'var(--gr)':sc==='red'?'var(--rd)':'var(--gd)';
-  const pv=document.getElementById('pv');pv.textContent=d.pcr_all;pv.style.color=col;
-  const pb=document.getElementById('pb');pb.textContent=d.bias;pb.style.color=col;
+  document.getElementById('pv').textContent=d.pcr_all;document.getElementById('pv').style.color=col;
+  document.getElementById('pb').textContent=d.bias;document.getElementById('pb').style.color=col;
   document.getElementById('pbar').style.width=Math.min(d.pcr_all/2*100,100)+'%';
   document.getElementById('co').textContent=d.c_oi_cr?d.c_oi_cr+'Cr':'—';
   document.getElementById('po').textContent=d.p_oi_cr?d.p_oi_cr+'Cr':'—';
@@ -333,38 +353,36 @@ function render(d){
   document.getElementById('rh').textContent=fii(d.range_high);
   const c1=d.calls[0]?.s,p1=d.puts[0]?.s;
   document.getElementById('struct').innerHTML=`
-    <div class="rd">&#128308; ${fii((c1||0)+500)} CE &#8592; Upper wall<br><strong>&#128308; ${fii(c1)} CE &#8592; CEILING</strong></div>
-    <div style="color:var(--ln)">${'&#9135;'.repeat(28)}</div>
+    <div class="rd">&#128308; ${fii((c1||0)+500)} CE ← Upper wall<br><strong>&#128308; ${fii(c1)} CE ← CEILING</strong></div>
+    <div style="color:var(--ln)">──────────────────────────────</div>
     <div class="ac" style="font-size:15px;font-weight:900">&#128205; ${fi(d.spot)} &nbsp; ATM ${fii(d.atm)}</div>
-    <div style="color:var(--ln)">${'&#9135;'.repeat(28)}</div>
-    <div class="gr"><strong>&#128994; ${fii(p1)} PE &#8592; FLOOR</strong><br>&#128994; ${fii((p1||0)-500)} PE &#8592; Deep floor</div>
+    <div style="color:var(--ln)">──────────────────────────────</div>
+    <div class="gr"><strong>&#128994; ${fii(p1)} PE ← FLOOR</strong><br>&#128994; ${fii((p1||0)-500)} PE ← Deep floor</div>
     <div class="gd">&#127919; Max Pain: ${fii(d.max_pain)}</div>
-    <div style="color:var(--mt)">&#128208; Range: ${fii(d.range_low)} &#8211; ${fii(d.range_high)}</div>`;
+    <div style="color:var(--mt)">&#128208; Range: ${fii(d.range_low)} – ${fii(d.range_high)}</div>`;
   document.getElementById('cw').innerHTML=oiBar(d.calls,true);
   document.getElementById('pw').innerHTML=oiBar(d.puts,false);
   const brd=sc==='green'?'rgba(0,255,136,.3)':sc==='red'?'rgba(255,51,85,.3)':'rgba(255,204,0,.3)';
   const bg=sc==='green'?'rgba(0,255,136,.05)':sc==='red'?'rgba(255,51,85,.05)':'rgba(255,204,0,.05)';
-  const sigC=document.getElementById('sc');sigC.style.borderColor=brd;sigC.style.background=bg;
+  document.getElementById('sc').style.borderColor=brd;document.getElementById('sc').style.background=bg;
   const icon=sc==='green'?'&#128994;':sc==='red'?'&#128308;':'&#129001;';
   document.getElementById('sa').innerHTML=`<span style="color:${col}">${icon} ${d.signal}</span>`;
-  const sb=document.getElementById('sb');sb.textContent=d.buy;sb.style.color=col;
+  document.getElementById('sb').textContent=d.buy;document.getElementById('sb').style.color=col;
   document.getElementById('sh').textContent=d.hedge;
-  document.getElementById('t1').textContent=fii(d.t1);
-  document.getElementById('t2').textContent=fii(d.t2);
+  document.getElementById('t1').textContent=fii(d.t1);document.getElementById('t2').textContent=fii(d.t2);
   document.getElementById('nt').textContent=d.note;
   document.getElementById('dot').style.background='var(--gr)';
   document.getElementById('dot').className='dot live';
   document.getElementById('stxt').textContent='LIVE';
   document.getElementById('ld').style.display='none';
   document.getElementById('er').style.display='none';
-  document.getElementById('mn').style.display='flex';
-  cd=120;
+  document.getElementById('mn').style.display='flex';cd=120;
 }
 async function load(){
   document.getElementById('rb').disabled=true;
   document.getElementById('stxt').textContent='Fetching...';
   try{const r=await fetch('/api/data');render(await r.json());}
-  catch(e){document.getElementById('er').style.display='flex';document.getElementById('em').textContent='Network error: '+e.message;}
+  catch(e){document.getElementById('er').style.display='flex';document.getElementById('em').textContent='Network: '+e.message;}
   finally{document.getElementById('rb').disabled=false;}
 }
 setInterval(()=>{cd--;if(cd<=0)load();},1000);
