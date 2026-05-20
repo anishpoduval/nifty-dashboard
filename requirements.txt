@@ -2,5 +2,3 @@ flask==3.0.3
 requests==2.32.3
 gunicorn==22.0.0
 pyotp==2.9.0
-smartapi-python==1.4.1
-websocket-client==1.7.0
