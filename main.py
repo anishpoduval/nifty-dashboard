@@ -7,23 +7,42 @@ app = Flask(__name__)
 
 # ─── In-memory cache ──────────────────────────────────────────
 _cache = {"data": None, "ts": 0}
-CACHE_TTL = 90  # seconds
+CACHE_TTL = 120  # seconds
 
 # ─── NSE Helpers ──────────────────────────────────────────────
 def nse_session():
     s = requests.Session()
-    s.headers.update({
+    hdrs = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
-    })
+        "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                   "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+    s.headers.update(hdrs)
     try:
-        s.get("https://www.nseindia.com", timeout=15)
+        r1 = s.get("https://www.nseindia.com", timeout=20)
+        time.sleep(3)
+        r2 = s.get("https://www.nseindia.com/market-data/live-equity-market",
+                   timeout=20)
         time.sleep(2)
-        s.get("https://www.nseindia.com/option-chain", timeout=15)
+        s.headers.update({
+            "Referer": "https://www.nseindia.com/option-chain",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
         time.sleep(1)
     except Exception:
         pass
@@ -31,10 +50,22 @@ def nse_session():
 
 
 def fetch_chain(s):
-    url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-    r = s.get(url, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    urls = [
+        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+        "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY&identifier=OPTIDXNIFTY",
+    ]
+    for url in urls:
+        try:
+            r = s.get(url, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if "records" in data:
+                return data
+            time.sleep(2)
+        except Exception:
+            time.sleep(2)
+            continue
+    raise Exception("NSE blocked all attempts — retrying in 90s")
 
 
 def fetch_fii(s):
@@ -190,7 +221,13 @@ def api_data():
         _cache["ts"] = now
         return jsonify(data)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e),
+        err_msg = str(e)
+        # If NSE blocked, return last cached data with warning
+        if _cache["data"]:
+            stale = _cache["data"].copy()
+            stale["warning"] = "NSE blocked fresh fetch. Showing cached data from " + _cache["data"].get("ts","unknown")
+            return jsonify(stale)
+        return jsonify({"ok": False, "error": err_msg,
                         "ts": datetime.now().strftime("%I:%M:%S %p")})
 
 
