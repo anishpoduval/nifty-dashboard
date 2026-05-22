@@ -19,21 +19,18 @@ _c = {
 }
 
 # ── Single auth function ───────────────────────────────────────
-_auth_lock = threading.Lock()
-
 def get_obj():
-    with _auth_lock:
-        if _c["obj"] and time.time()-_c["obj_ts"] < 3000:
-            return _c["obj"], _c["jwt"]
-        totp = pyotp.TOTP(TOTP_SECRET).now()
-        obj  = SmartConnect(api_key=API_KEY)
-        data = obj.generateSession(CLIENT_CODE, ANGEL_PIN, totp)
-        if not data.get("status"):
-            raise Exception("Login failed: " + str(data.get("message","")) + " | " + str(data))
-        _c["obj"] = obj
-        _c["jwt"] = data["data"]["jwtToken"]
-        _c["obj_ts"] = time.time()
-        return obj, _c["jwt"]
+    if _c["obj"] and time.time()-_c["obj_ts"] < 2700:
+        return _c["obj"], _c["jwt"]
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    obj  = SmartConnect(api_key=API_KEY)
+    data = obj.generateSession(CLIENT_CODE, ANGEL_PIN, totp)
+    if not data.get("status"):
+        raise Exception("Login failed: " + str(data.get("message","")) + " | " + str(data))
+    _c["obj"] = obj
+    _c["jwt"] = data["data"]["jwtToken"]
+    _c["obj_ts"] = time.time()
+    return obj, _c["jwt"]
 
 # ── REST headers ──────────────────────────────────────────────
 def rest_headers(jwt):
@@ -95,7 +92,7 @@ def fetch_oi_rest(jwt, spot):
         try:
             r = requests.post(
                 "https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/optionChain",
-                json=body, headers=hdrs, timeout=20)
+                json=body, headers=hdrs, timeout=5)
             d = r.json()
             if d.get("data") and isinstance(d["data"], list) and len(d["data"]) > 3:
                 return d["data"], expiry
@@ -281,6 +278,7 @@ def bg_spot():
             s = fetch_spot_rest(obj, jwt)
             if s > 0:
                 _c["spot"] = s
+            if _c["spot"] > 0:
                 _c["spot_ts"] = time.time()
         except Exception as e:
             _c["errors"].append("spot:"+str(e)[:60])
@@ -337,7 +335,7 @@ def api_live():
     return jsonify({
         "ok":True,"spot":spot,"oi":oi,"sig":sig,
         "ts":datetime.now().strftime("%H:%M:%S"),
-        "market_open": 9 <= datetime.now().hour < 16,
+        "market_open": 9*60+15 <= (datetime.utcnow().hour*60+datetime.utcnow().minute+330)%1440 < 15*60+31,
         "spot_age": round(time.time()-_c["spot_ts"],1) if _c["spot_ts"] else 99,
         "oi_age":   round(time.time()-_c["oi_ts"],0)  if _c["oi_ts"]   else -1,
         "candles":  len(_c["candles"])
