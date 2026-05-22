@@ -1,4 +1,4 @@
-import os, time, pyotp, requests, math, threading
+import os, time, pyotp, requests, math, threading, json
 from flask import Flask, jsonify, render_template_string
 from datetime import datetime, date, timedelta
 from SmartApi import SmartConnect
@@ -10,10 +10,14 @@ CLIENT_CODE = "A61831553"
 ANGEL_PIN   = "8547"
 TOTP_SECRET = "XA5CSSZRIMAHEQRJAGJFCJ5MLE"
 
-_c = {"obj":None,"obj_ts":0,"jwt":None,"spot":None,"spot_ts":0,
-      "oi":None,"oi_ts":0,"candles":[],"candles_ts":0}
-SPOT_TTL=1; OI_TTL=90; CANDLE_TTL=60
+_c = {"obj":None,"obj_ts":0,"jwt":None,
+      "spot":0,"spot_ts":0,
+      "oi":None,"oi_ts":0,
+      "candles":[],"candles_ts":0,
+      "sig":None}
+OI_TTL=90; CANDLE_TTL=60
 
+# ── Auth ──────────────────────────────────────────────────────
 def get_obj():
     if _c["obj"] and time.time()-_c["obj_ts"]<3000:
         return _c["obj"],_c["jwt"]
@@ -24,67 +28,111 @@ def get_obj():
     _c["obj"]=obj; _c["jwt"]=data["data"]["jwtToken"]; _c["obj_ts"]=time.time()
     return obj,_c["jwt"]
 
-def fetch_spot_now():
-    obj,_=get_obj()
-    for exch,token in [("NSE","99926000"),("NSE","26000")]:
+# ── Background: spot every 1s ─────────────────────────────────
+def bg_spot():
+    while True:
         try:
-            r=obj.ltpData(exch,"Nifty 50",token)
-            if r.get("status") and r.get("data",{}).get("ltp"):
-                return float(r["data"]["ltp"])
-        except: continue
-    raise Exception("Spot unavailable")
+            obj,_=get_obj()
+            for _e,token in [("NSE","99926000"),("NSE","26000")]:
+                try:
+                    r=obj.ltpData(_e,"Nifty 50",token)
+                    if r.get("status") and r.get("data",{}).get("ltp"):
+                        _c["spot"]=float(r["data"]["ltp"]); _c["spot_ts"]=time.time()
+                        break
+                except: continue
+        except: pass
+        time.sleep(1)
 
-def get_spot():
-    if _c["spot"] and time.time()-_c["spot_ts"]<SPOT_TTL:
-        return _c["spot"]
-    s=fetch_spot_now(); _c["spot"]=s; _c["spot_ts"]=time.time()
-    return s
-
-def get_candles():
-    if _c["candles"] and time.time()-_c["candles_ts"]<CANDLE_TTL:
-        return _c["candles"]
-    obj,_=get_obj()
-    td=date.today(); fd=td.strftime("%Y-%m-%d")+" 09:15"; t2=td.strftime("%Y-%m-%d")+" 15:30"
-    for token in ["99926000","26000"]:
+# ── Background: OI + candles every 60s ────────────────────────
+def bg_heavy():
+    time.sleep(5)  # let spot warm up first
+    while True:
         try:
-            d=obj.getCandleData({"exchange":"NSE","symboltoken":token,
-                "interval":"FIVE_MINUTE","fromdate":fd,"todate":t2})
-            if d.get("status") and d.get("data"):
-                _c["candles"]=d["data"]; _c["candles_ts"]=time.time()
-                return d["data"]
-        except: continue
-    return _c["candles"]
+            obj,jwt=get_obj()
+            spot=_c["spot"] or 23650
+            atm=round(spot/50)*50
+            expiry=next_expiry()
+
+            # ── Fetch option chain (try ALL methods) ──────────
+            chain=None
+            methods_tried=[]
+
+            # Method 1: optionChain with ATM strike
+            try:
+                d=obj.optionChain("NIFTY",expiry,str(atm),"OPTIDX")
+                methods_tried.append(("optionChain ATM",bool(d.get("data")),str(d.get("message",""))[:50]))
+                if d.get("status") and d.get("data") and len(d.get("data",[]))>3:
+                    chain=d["data"]
+            except Exception as e:
+                methods_tried.append(("optionChain ATM","error",str(e)[:50]))
+
+            # Method 2: optionChain with 0 strike
+            if not chain:
+                try:
+                    d=obj.optionChain("NIFTY",expiry,"0","OPTIDX")
+                    methods_tried.append(("optionChain 0",bool(d.get("data")),str(d.get("message",""))[:50]))
+                    if d.get("status") and d.get("data") and len(d.get("data",[]))>3:
+                        chain=d["data"]
+                except Exception as e:
+                    methods_tried.append(("optionChain 0","error",str(e)[:50]))
+
+            # Method 3: REST with different body formats
+            if not chain:
+                for body_fmt in [
+                    {"name":"NIFTY","expirydate":expiry},
+                    {"exchange":"NFO","name":"NIFTY","expirydate":expiry},
+                    {"symbol":"NIFTY","expirydate":expiry,"exchange":"NFO"},
+                ]:
+                    try:
+                        hdrs={"Authorization":"Bearer "+jwt,"Content-Type":"application/json",
+                              "Accept":"application/json","X-UserType":"USER","X-SourceID":"WEB",
+                              "X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"106.193.147.98",
+                              "X-MACAddress":"fe80::216e:6507:4b90:3719","X-PrivateKey":API_KEY}
+                        r=requests.post(
+                            "https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/optionChain",
+                            json=body_fmt,headers=hdrs,timeout=15)
+                        d=r.json()
+                        methods_tried.append(("REST "+str(body_fmt.get("exchange","")),
+                                              bool(d.get("data")),str(d.get("message",""))[:80]))
+                        if d.get("data") and len(d.get("data",[]))>3:
+                            chain=d["data"]; break
+                    except Exception as e:
+                        methods_tried.append(("REST","error",str(e)[:50]))
+
+            _c["oi_methods"]=methods_tried  # for debug
+
+            # Parse OI
+            _c["oi"]=parse_oi(chain,spot,expiry)
+            _c["oi_ts"]=time.time()
+
+            # ── Fetch candles ─────────────────────────────────
+            td=date.today()
+            fd=td.strftime("%Y-%m-%d")+" 09:15"; t2=td.strftime("%Y-%m-%d")+" 15:30"
+            candle_data=None
+            for token in ["99926000","26000"]:
+                try:
+                    d=obj.getCandleData({"exchange":"NSE","symboltoken":token,
+                        "interval":"FIVE_MINUTE","fromdate":fd,"todate":t2})
+                    if d.get("status") and d.get("data"):
+                        candle_data=d["data"]; break
+                except: continue
+            if candle_data:
+                _c["candles"]=candle_data; _c["candles_ts"]=time.time()
+
+            # ── Compute signal ────────────────────────────────
+            _c["sig"]=compute_signal(spot,_c["oi"],_c["candles"])
+
+        except Exception as e:
+            _c["bg_error"]=str(e)
+        time.sleep(60)
+
+threading.Thread(target=bg_spot,daemon=True).start()
+threading.Thread(target=bg_heavy,daemon=True).start()
 
 def next_expiry():
     today=date.today(); days=(3-today.weekday())%7
     if days==0 and datetime.now().hour>=15: days=7
     return (today+timedelta(days=days)).strftime("%d%b%Y").upper()
-
-def get_oi(spot):
-    if _c["oi"] and time.time()-_c["oi_ts"]<OI_TTL:
-        return _c["oi"]
-    obj,jwt=get_obj(); atm=round(spot/50)*50; expiry=next_expiry()
-    chain=None
-    for strike in [str(atm),"0"]:
-        try:
-            d=obj.optionChain("NIFTY",expiry,strike,"OPTIDX")
-            if d.get("status") and d.get("data") and len(d["data"])>5:
-                chain=d["data"]; break
-        except: pass
-    if not chain:
-        try:
-            h={"Authorization":"Bearer "+jwt,"Content-Type":"application/json",
-               "Accept":"application/json","X-UserType":"USER","X-SourceID":"WEB",
-               "X-ClientLocalIP":"127.0.0.1","X-ClientPublicIP":"106.193.147.98",
-               "X-MACAddress":"fe80::216e:6507:4b90:3719","X-PrivateKey":API_KEY}
-            r=requests.post("https://apiconnect.angelbroking.com/rest/secure/angelbroking/marketData/v1/optionChain",
-                json={"name":"NIFTY","expirydate":expiry},headers=h,timeout=15)
-            d=r.json()
-            if d.get("data") and len(d["data"])>5: chain=d["data"]
-        except: pass
-    result=parse_oi(chain,spot,expiry)
-    _c["oi"]=result; _c["oi_ts"]=time.time()
-    return result
 
 def parse_oi(chain,spot,expiry):
     atm=round(spot/50)*50; live=False; co={}; po={}
@@ -94,21 +142,31 @@ def parse_oi(chain,spot,expiry):
             sp=row.get("strikePrice") or row.get("strike",0)
             try: sp=int(float(sp))
             except: continue
+            # Try every possible field name
             ce=row.get("CE") or {}; pe=row.get("PE") or {}
-            coi=ce.get("openInterest",0) if isinstance(ce,dict) else row.get("callOI",0)
-            poi=pe.get("openInterest",0) if isinstance(pe,dict) else row.get("putOI",0)
+            coi=0; poi=0
+            if isinstance(ce,dict):
+                coi=ce.get("openInterest",0) or ce.get("oi",0) or ce.get("OI",0)
+            else:
+                coi=row.get("CE_openInterest",0) or row.get("callOI",0) or row.get("call_oi",0)
+            if isinstance(pe,dict):
+                poi=pe.get("openInterest",0) or pe.get("oi",0) or pe.get("OI",0)
+            else:
+                poi=row.get("PE_openInterest",0) or row.get("putOI",0) or row.get("put_oi",0)
             try: co[sp]=int(coi)
             except: pass
             try: po[sp]=int(poi)
             except: pass
+
     tc=sum(co.values()); tp=sum(po.values())
-    pcr=round(tp/tc,2) if tc>0 else 1.0
+    pcr=round(tp/tc,2) if tc>0 else 0
+    if not live: pcr=0  # Show 0 when estimated, not fake 1.0
     calls=sorted([(s,o) for s,o in co.items() if s>spot],  key=lambda x:-x[1])[:6]
     puts =sorted([(s,o) for s,o in po.items() if s<=spot], key=lambda x:-x[1])[:6]
     cw1=calls[0][0] if calls else int(round(spot/500+.5)*500)
     pw1=puts[0][0]  if puts  else int(round(spot/500-.5)*500)
     cw2=calls[1][0] if len(calls)>1 else cw1+500
-    pw2=puts[1][0]  if len(puts)>1 else pw1-500
+    pw2=puts[1][0] if len(puts)>1 else pw1-500
     mp=atm
     if co and po:
         try:
@@ -123,7 +181,9 @@ def parse_oi(chain,spot,expiry):
             "cw1":cw1,"cw2":cw2,"pw1":pw1,"pw2":pw2,
             "c_cr":round(tc/10000000,2),"p_cr":round(tp/10000000,2),
             "calls":[{"s":s,"oi":round(o/100000,1)} for s,o in calls[:5]],
-            "puts" :[{"s":s,"oi":round(o/100000,1)} for s,o in puts[:5]]}
+            "puts" :[{"s":s,"oi":round(o/100000,1)} for s,o in puts[:5]],
+            "total_call":tc,"total_put":tp,
+            "chain_rows":len(chain) if chain else 0}
 
 def vwap_calc(candles):
     if not candles: return 0,0,0
@@ -160,46 +220,51 @@ def patterns_calc(candles):
         if body<0.1*rng:
             pats.append({"name":"Doji","type":"neutral","desc":"Indecision"})
         elif lsh>2*body and ush<body and bull:
-            pats.append({"name":"Hammer","type":"bullish","desc":"Bullish reversal at support"})
-        elif ush>2*body and lsh<body and bull:
-            pats.append({"name":"Shooting Star","type":"bearish","desc":"Bearish reversal at resistance"})
+            pats.append({"name":"Hammer","type":"bullish","desc":"Bullish reversal"})
+        elif ush>2*body and lsh<body:
+            pats.append({"name":"Shooting Star","type":"bearish","desc":"Bearish reversal"})
         if i>0:
             p=candles[i-1]; po2,pcl=p[1],p[4]
             if bull and pcl<po2 and cl>po2 and o<pcl:
-                pats.append({"name":"Bull Engulfing","type":"bullish","desc":"Strong reversal up — watch CE"})
+                pats.append({"name":"Bull Engulfing","type":"bullish","desc":"Strong reversal up"})
             elif not bull and pcl>po2 and cl<po2 and o>pcl:
-                pats.append({"name":"Bear Engulfing","type":"bearish","desc":"Strong reversal down — watch PE"})
+                pats.append({"name":"Bear Engulfing","type":"bearish","desc":"Strong reversal down"})
     return pats[-2:]
 
 def compute_signal(spot,oi,candles):
-    atm=round(spot/50)*50; score=0; reasons=[]
-    pcr=oi["pcr"]
-    if pcr>=1.2:   score+=3; reasons.append("PCR "+str(pcr)+" bullish")
-    elif pcr>=1.0: score+=1; reasons.append("PCR "+str(pcr)+" mild bull")
-    elif pcr<=0.7: score-=3; reasons.append("PCR "+str(pcr)+" bearish")
-    elif pcr<=0.9: score-=1; reasons.append("PCR "+str(pcr)+" mild bear")
-    else: reasons.append("PCR "+str(pcr)+" neutral")
+    if not oi: oi={"pcr":0,"cw1":0,"pw1":0,"live":False,"expiry":"","atm":0,"mp":0,"straddle":0,
+                   "range_low":0,"range_high":0,"cw2":0,"pw2":0,"c_cr":0,"p_cr":0,"calls":[],"puts":[],
+                   "total_call":0,"total_put":0,"chain_rows":0}
+    atm=round(spot/50)*50; score=0; reasons=[]; pcr=oi["pcr"]
+    if pcr>0:  # Only use PCR if we have real data
+        if pcr>=1.2:   score+=3; reasons.append("PCR "+str(pcr)+" bullish")
+        elif pcr>=1.0: score+=1; reasons.append("PCR "+str(pcr)+" mild bull")
+        elif pcr<=0.7: score-=3; reasons.append("PCR "+str(pcr)+" bearish")
+        elif pcr<=0.9: score-=1; reasons.append("PCR "+str(pcr)+" mild bear")
+        else: reasons.append("PCR "+str(pcr)+" neutral")
+    else:
+        reasons.append("PCR unavailable")
     vwap=upper=lower=0; rsi=50; hist=0; pats=[]
-    if candles:
+    if candles and len(candles)>5:
         closes=[c[4] for c in candles]
         vwap,upper,lower=vwap_calc(candles)
         rsi=rsi_calc(closes); _,_,hist=macd_calc(closes)
         pats=patterns_calc(candles)
         if vwap>0:
-            if spot>vwap: score+=2; reasons.append("Above VWAP "+str(vwap))
-            else: score-=2; reasons.append("Below VWAP "+str(vwap))
+            if spot>vwap: score+=2; reasons.append("Above VWAP "+str(int(vwap)))
+            else: score-=2; reasons.append("Below VWAP "+str(int(vwap)))
         if rsi>=60: score+=2; reasons.append("RSI "+str(rsi)+" bullish")
-        elif rsi>=50: score+=1
         elif rsi<=40: score-=2; reasons.append("RSI "+str(rsi)+" bearish")
-        elif rsi<=50: score-=1
         if hist>0: score+=1; reasons.append("MACD bull cross")
         elif hist<0: score-=1; reasons.append("MACD bear cross")
         for p in pats:
             if p["type"]=="bullish": score+=1
             elif p["type"]=="bearish": score-=1
-    cw1=oi["cw1"]; pw1=oi["pw1"]
-    if abs(spot-cw1)<50: score-=1; reasons.append("Near call wall "+str(cw1))
-    if abs(spot-pw1)<50: score+=1; reasons.append("Near put floor "+str(pw1))
+    else:
+        reasons.append("No candle data (mkt closed?)")
+    cw1=oi.get("cw1",atm+500); pw1=oi.get("pw1",atm-500)
+    if cw1 and abs(spot-cw1)<50: score-=1
+    if pw1 and abs(spot-pw1)<50: score+=1
     strength=min(abs(score)/9*100,100)
     if score>=4:    action="BUY CALL"; color="green"; strike=str(atm+50)+" CE"; hedge=str(atm-200)+" PE"; t1,t2=cw1,cw1+100; conf="HIGH" if score>=6 else "MEDIUM"
     elif score<=-4: action="BUY PUT";  color="red";   strike=str(atm-50)+" PE"; hedge=str(atm+200)+" CE"; t1,t2=pw1,pw1-100; conf="HIGH" if score<=-6 else "MEDIUM"
@@ -207,29 +272,97 @@ def compute_signal(spot,oi,candles):
     elif score<=-2: action="LEAN PUT"; color="red";   strike=str(atm-50)+" PE"; hedge=str(atm+200)+" CE"; t1,t2=pw1,pw1-50;  conf="LOW"
     else:           action="WAIT";     color="gold";  strike="No setup yet";    hedge="--"; t1=cw1; t2=pw1; conf="--"
     return {"action":action,"color":color,"strike":strike,"hedge":hedge,"t1":t1,"t2":t2,
-            "conf":conf,"score":score,"strength":round(strength),"reasons":reasons[:4],
+            "conf":conf,"score":score,"strength":round(strength),"reasons":reasons[:5],
             "vwap":vwap,"upper":upper,"lower":lower,"rsi":rsi,"hist":hist,
             "macd_bull":hist>0,"patterns":pats,"candles_count":len(candles)}
 
-def bg_refresh():
-    while True:
-        try:
-            s=fetch_spot_now(); _c["spot"]=s; _c["spot_ts"]=time.time()
-        except: pass
-        time.sleep(1)
+# ── API: spot only (ultra fast, no other calls) ───────────────
+@app.route("/api/spot")
+def api_spot():
+    return jsonify({"spot":_c["spot"],"ts":datetime.now().strftime("%H:%M:%S.%f")[:12]})
 
-threading.Thread(target=bg_refresh,daemon=True).start()
-
+# ── API: full data (from cache, no blocking) ──────────────────
 @app.route("/api/live")
 def api_live():
+    spot=_c["spot"]
+    if not spot:
+        return jsonify({"ok":False,"error":"Spot not ready yet - background thread starting",
+                        "ts":datetime.now().strftime("%H:%M:%S")})
+    oi=_c["oi"] or parse_oi(None,spot,next_expiry())
+    sig=_c["sig"] or compute_signal(spot,oi,_c["candles"])
+    return jsonify({"ok":True,"spot":spot,"oi":oi,"sig":sig,
+                    "ts":datetime.now().strftime("%H:%M:%S"),
+                    "market_open":9<=datetime.now().hour<16,
+                    "spot_age":round(time.time()-_c["spot_ts"],1),
+                    "oi_age":round(time.time()-_c["oi_ts"]) if _c["oi_ts"] else -1})
+
+# ── API: debug (shows raw API responses) ──────────────────────
+@app.route("/api/debug")
+def api_debug():
+    result = {"timestamp": datetime.now().strftime("%d %b %Y %H:%M:%S")}
+    result["credentials"] = {
+        "api_key": API_KEY[:4]+"****",
+        "client": CLIENT_CODE,
+        "totp_secret": TOTP_SECRET[:4]+"****"
+    }
+    result["cache"] = {
+        "spot": _c["spot"],
+        "spot_age_sec": round(time.time()-_c["spot_ts"],1) if _c["spot_ts"] else "never",
+        "oi_age_sec": round(time.time()-_c["oi_ts"],1) if _c["oi_ts"] else "never",
+        "candles_count": len(_c["candles"]),
+        "candles_age_sec": round(time.time()-_c["candles_ts"],1) if _c["candles_ts"] else "never",
+    }
+    if _c.get("oi"):
+        result["oi_summary"] = {
+            "live": _c["oi"]["live"],
+            "pcr": _c["oi"]["pcr"],
+            "chain_rows": _c["oi"].get("chain_rows",0),
+            "total_call_oi": _c["oi"].get("total_call",0),
+            "total_put_oi": _c["oi"].get("total_put",0),
+        }
+    result["oi_methods_tried"] = _c.get("oi_methods",[])
+    result["bg_error"] = _c.get("bg_error","none")
+
+    # Live test: try option chain right now
     try:
-        spot=get_spot(); oi=get_oi(spot); candles=get_candles()
-        sig=compute_signal(spot,oi,candles)
-        return jsonify({"ok":True,"spot":spot,"oi":oi,"sig":sig,
-                        "ts":datetime.now().strftime("%H:%M:%S"),
-                        "market_open": 9<=datetime.now().hour<16})
+        obj,jwt=get_obj()
+        result["login"]="OK"
+        expiry=next_expiry()
+        result["expiry"]=expiry
+
+        # Test optionChain
+        try:
+            d=obj.optionChain("NIFTY",expiry,"0","OPTIDX")
+            result["optionChain_raw"]={
+                "status":d.get("status"),
+                "message":d.get("message"),
+                "data_type":str(type(d.get("data"))),
+                "data_length":len(d.get("data",[])) if isinstance(d.get("data"),list) else "not a list",
+                "first_row":str(d.get("data",[None])[0])[:200] if d.get("data") else "empty",
+            }
+        except Exception as e:
+            result["optionChain_error"]=str(e)
+
+        # Test getCandleData
+        td=date.today()
+        try:
+            d=obj.getCandleData({"exchange":"NSE","symboltoken":"99926000",
+                "interval":"FIVE_MINUTE",
+                "fromdate":td.strftime("%Y-%m-%d")+" 09:15",
+                "todate":td.strftime("%Y-%m-%d")+" 15:30"})
+            result["candle_raw"]={
+                "status":d.get("status"),
+                "message":d.get("message"),
+                "data_length":len(d.get("data",[])) if isinstance(d.get("data"),list) else "not a list",
+                "last_candle":str(d.get("data",[[]])[-1])[:100] if d.get("data") else "empty",
+            }
+        except Exception as e:
+            result["candle_error"]=str(e)
+
     except Exception as e:
-        return jsonify({"ok":False,"error":str(e),"ts":datetime.now().strftime("%H:%M:%S")})
+        result["login"]="FAILED: "+str(e)
+
+    return jsonify(result)
 
 @app.route("/api/test")
 def api_test():
@@ -254,11 +387,11 @@ HTML = """<!DOCTYPE html>
 :root{--bg:#070b12;--s1:#0c1220;--s2:#111a2a;--s3:#162235;--ln:#1d2f45;
   --acc:#00c8ff;--gr:#00e87a;--rd:#ff2d55;--gd:#ffd60a;
   --mt:#334d66;--tx:#8ab4cc;--wh:#eef6ff}
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{background:var(--bg);color:var(--tx);font-family:-apple-system,'SF Pro Text','Segoe UI',sans-serif;min-height:100vh}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--tx);font-family:-apple-system,'SF Pro Text',sans-serif;min-height:100vh}
 .hdr{background:var(--s1);border-bottom:1px solid var(--ln);padding:12px 16px;position:sticky;top:0;z-index:50}
-.spot-num{font-size:30px;font-weight:800;color:var(--wh);letter-spacing:-1px;font-variant-numeric:tabular-nums;transition:color .2s}
-.chg-badge{font-size:12px;font-weight:600;padding:3px 8px;border-radius:20px;margin-left:8px;display:inline-block;transition:all .2s}
+.spot-num{font-size:30px;font-weight:800;color:var(--wh);letter-spacing:-1px;font-variant-numeric:tabular-nums;transition:color .15s}
+.chg-badge{font-size:12px;font-weight:600;padding:3px 8px;border-radius:20px;margin-left:8px;transition:all .2s}
 .live-pill{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;letter-spacing:1px;padding:3px 8px;border-radius:20px;background:rgba(0,232,122,.1);color:var(--gr);border:1px solid rgba(0,232,122,.25)}
 .pulse{width:6px;height:6px;border-radius:50%;background:var(--gr);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
@@ -275,7 +408,6 @@ body{background:var(--bg);color:var(--tx);font-family:-apple-system,'SF Pro Text
 .ml{font-size:8px;color:var(--mt);letter-spacing:1px;margin-bottom:5px;text-transform:uppercase}
 .mv{font-size:14px;font-weight:700;color:var(--wh)}
 .mv.sm{font-size:12px}
-/* Signal hero */
 .hero{border-radius:20px;padding:22px 18px;border:2px solid rgba(255,214,10,.3);background:rgba(255,214,10,.05);margin:14px 14px 0;transition:all .4s}
 .hero.bull{border-color:rgba(0,232,122,.35);background:rgba(0,232,122,.06)}
 .hero.bear{border-color:rgba(255,45,85,.35);background:rgba(255,45,85,.06)}
@@ -290,437 +422,183 @@ body{background:var(--bg);color:var(--tx);font-family:-apple-system,'SF Pro Text
 .str-fill{height:100%;border-radius:2px;transition:width .6s}
 .reasons{margin-top:12px;display:flex;flex-wrap:wrap;gap:6px}
 .reason-chip{font-size:10px;padding:4px 10px;border-radius:20px;background:rgba(255,255,255,.05);color:var(--tx);border:1px solid var(--ln)}
-/* PCR */
 .pcr-num{font-size:48px;font-weight:900;line-height:1}
 .pcr-track{height:8px;background:var(--ln);border-radius:4px;overflow:hidden;margin:10px 0 4px}
 .pcr-fill{height:100%;background:linear-gradient(90deg,var(--rd),var(--gd) 50%,var(--gr));transition:width 1s}
-/* OI bars */
 .oi-item{margin-bottom:12px}
 .oi-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
 .oi-track{height:6px;background:var(--ln);border-radius:3px;overflow:hidden}
 .oi-fill{height:100%;border-radius:3px;transition:width .8s}
-/* Levels */
 .lvl{background:var(--s2);border-radius:12px;padding:14px;font-size:13px;line-height:2.8}
-/* VWAP track */
 .vtrack{height:10px;background:var(--ln);border-radius:5px;position:relative;margin:12px 0}
 .vdot{position:absolute;top:-3px;width:16px;height:16px;border-radius:50%;background:var(--acc);border:3px solid var(--bg);transform:translateX(-50%);transition:left .6s;box-shadow:0 0 8px var(--acc)}
 .vmid{position:absolute;top:0;left:50%;width:2px;height:10px;background:var(--gd);opacity:.5}
-/* RSI big */
 .ind-big{font-size:42px;font-weight:900;line-height:1}
 .ind-track{height:6px;background:var(--ln);border-radius:3px;overflow:hidden;margin:8px 0 3px}
 .ind-fill{height:100%;border-radius:3px;transition:width .8s}
-/* Patterns */
 .pat{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:10px;font-size:12px;font-weight:600;margin:4px;border:1px solid var(--ln)}
 .pat.bull{background:rgba(0,232,122,.08);color:var(--gr);border-color:rgba(0,232,122,.25)}
 .pat.bear{background:rgba(255,45,85,.08);color:var(--rd);border-color:rgba(255,45,85,.25)}
-.pat.neutral{background:rgba(255,255,255,.04);color:var(--mt)}
-/* Misc */
 .ld{text-align:center;padding:50px 20px;color:var(--mt)}
 .ldot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--acc);margin:0 3px;animation:la .8s infinite}
 .ldot:nth-child(2){animation-delay:.15s}.ldot:nth-child(3){animation-delay:.3s}
 @keyframes la{0%,80%,100%{transform:scale(0);opacity:.3}40%{transform:scale(1);opacity:1}}
 .err-box{margin:14px;padding:16px;background:rgba(255,45,85,.07);border:1px solid rgba(255,45,85,.25);border-radius:14px}
-.btn{background:rgba(0,200,255,.1);border:1px solid rgba(0,200,255,.25);border-radius:10px;padding:9px 16px;color:var(--acc);font-size:12px;font-weight:700;letter-spacing:1px;cursor:pointer;margin-top:10px}
+.btn{background:rgba(0,200,255,.1);border:1px solid rgba(0,200,255,.25);border-radius:10px;padding:9px 16px;color:var(--acc);font-size:12px;font-weight:700;cursor:pointer;margin-top:10px}
 .warn-box{background:rgba(255,214,10,.05);border:1px solid rgba(255,214,10,.2);border-radius:10px;padding:10px 12px;font-size:11px;color:var(--gd);margin-bottom:12px}
+.info-box{background:rgba(0,200,255,.04);border:1px solid rgba(0,200,255,.12);border-radius:14px;padding:14px;font-size:11px;color:var(--mt);line-height:2.1;margin-bottom:4px}
 .gr{color:var(--gr)}.rd{color:var(--rd)}.gd{color:var(--gd)}.ac{color:var(--acc)}
 .hide{display:none!important}
 </style></head><body>
-
 <div class="hdr">
   <div style="display:flex;justify-content:space-between;align-items:flex-start">
     <div>
-      <div id="live-pill" class="live-pill" style="margin-bottom:5px">
-        <span class="pulse"></span><span id="live-txt">CONNECTING</span>
-      </div>
-      <div>
-        <span class="spot-num" id="spot-num">--</span>
-        <span class="chg-badge" id="chg-badge" style="background:rgba(255,255,255,.05);color:var(--mt)">--</span>
-      </div>
+      <div id="live-pill" class="live-pill" style="margin-bottom:5px"><span class="pulse"></span><span id="live-txt">CONNECTING</span></div>
+      <div><span class="spot-num" id="spot-num">--</span><span class="chg-badge" id="chg-badge" style="background:rgba(255,255,255,.05);color:var(--mt)">--</span></div>
       <div style="font-size:10px;color:var(--mt);margin-top:4px" id="hdr-sub">--</div>
     </div>
     <div style="text-align:right">
       <div style="font-size:9px;color:var(--mt)" id="upd-ts">--</div>
-      <button class="btn" onclick="forceRefresh()" style="padding:6px 12px;margin-top:6px">&#8635;</button>
+      <div style="font-size:9px;color:var(--mt)" id="spot-age">--</div>
+      <button class="btn" onclick="location.reload()" style="padding:6px 12px;margin-top:6px">&#8635;</button>
     </div>
   </div>
 </div>
-
 <div class="tabs">
   <button class="tab on" id="tb1" onclick="goTab(1)">&#127919; SIGNAL</button>
   <button class="tab" id="tb2" onclick="goTab(2)">&#128200; OI DATA</button>
   <button class="tab" id="tb3" onclick="goTab(3)">&#9889; MOMENTUM</button>
 </div>
-
-<!-- ═══ TAB 1: SIGNAL ═══ -->
+<!-- TAB 1 -->
 <div id="pg1">
-  <div class="ld" id="p1ld"><span class="ldot"></span><span class="ldot"></span><span class="ldot"></span>
-    <div style="margin-top:14px;font-size:12px">Connecting to Angel One...</div></div>
-  <div id="p1err" class="hide">
-    <div class="err-box"><div class="rd" id="p1em" style="font-size:13px;word-break:break-word"></div>
-      <button class="btn" onclick="forceRefresh()">Retry</button></div></div>
+  <div class="ld" id="p1ld"><span class="ldot"></span><span class="ldot"></span><span class="ldot"></span><div style="margin-top:14px;font-size:12px">Connecting to Angel One...</div></div>
+  <div id="p1err" class="hide"><div class="err-box"><div class="rd" id="p1em"></div><div style="color:var(--mt);font-size:11px;margin-top:6px">Open <a href="/api/debug" target="_blank" style="color:var(--acc)">/api/debug</a> for diagnostics</div><button class="btn" onclick="location.reload()">Retry</button></div></div>
   <div id="p1main" class="hide">
-    <div class="hero" id="sig-hero">
-      <div class="hero-lbl">NIFTY SIGNAL &bull; <span id="s-exp">--</span></div>
-      <div class="hero-act" id="s-act">--</div>
-      <div class="hero-str" id="s-str">--</div>
-      <div><span class="conf-chip ch-lo" id="s-conf">--</span>
-        <span style="font-size:11px;color:var(--mt);margin-left:10px" id="s-score">--</span></div>
-      <div class="str-track"><div class="str-fill" id="s-sfill" style="width:0"></div></div>
-      <div class="reasons" id="s-reasons"></div>
-    </div>
+    <div class="hero" id="sig-hero"><div class="hero-lbl">NIFTY SIGNAL &bull; <span id="s-exp">--</span></div><div class="hero-act" id="s-act">--</div><div class="hero-str" id="s-str">--</div><div><span class="conf-chip ch-lo" id="s-conf">--</span><span style="font-size:11px;color:var(--mt);margin-left:10px" id="s-score">--</span></div><div class="str-track"><div class="str-fill" id="s-sfill" style="width:0"></div></div><div class="reasons" id="s-reasons"></div></div>
     <div class="wrap">
-      <div class="card">
-        <div class="ctitle">TRADE DETAILS</div>
-        <div class="g2" style="margin-bottom:10px">
-          <div class="mt"><div class="ml">BUY STRIKE</div><div class="mv sm" id="td-str" style="color:var(--gr)">--</div></div>
-          <div class="mt"><div class="ml">HEDGE</div><div class="mv sm gd" id="td-hdg">--</div></div>
-        </div>
-        <div class="g2">
-          <div class="mt"><div class="ml">TARGET 1</div><div class="mv sm ac" id="td-t1">--</div></div>
-          <div class="mt"><div class="ml">TARGET 2</div><div class="mv sm ac" id="td-t2">--</div></div>
-          <div class="mt"><div class="ml">STOP LOSS</div><div class="mv sm rd">40% prem</div></div>
-          <div class="mt"><div class="ml">LOT SIZE</div><div class="mv sm" style="color:var(--wh)">75</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ctitle">KEY LEVELS</div>
-        <div class="lvl" id="kl-struct">--</div>
-      </div>
-      <div style="background:rgba(255,214,10,.04);border:1px solid rgba(255,214,10,.12);border-radius:14px;padding:14px;font-size:11px;color:var(--mt);line-height:2.1;margin-bottom:4px">
-        <span style="color:var(--gd);font-weight:700">RULES</span> &bull;
-        Wait 9:30 candle &bull; 1-2 lots &bull; SL 40% &bull; Always hedge &bull; Exit before 3 PM
-      </div>
+      <div class="card"><div class="ctitle">TRADE DETAILS</div><div class="g2" style="margin-bottom:10px"><div class="mt"><div class="ml">BUY STRIKE</div><div class="mv sm" id="td-str" style="color:var(--gr)">--</div></div><div class="mt"><div class="ml">HEDGE</div><div class="mv sm gd" id="td-hdg">--</div></div></div><div class="g2"><div class="mt"><div class="ml">TARGET 1</div><div class="mv sm ac" id="td-t1">--</div></div><div class="mt"><div class="ml">TARGET 2</div><div class="mv sm ac" id="td-t2">--</div></div><div class="mt"><div class="ml">STOP LOSS</div><div class="mv sm rd">40% prem</div></div><div class="mt"><div class="ml">LOT SIZE</div><div class="mv sm" style="color:var(--wh)">75</div></div></div></div>
+      <div class="card"><div class="ctitle">KEY LEVELS</div><div class="lvl" id="kl-struct">--</div></div>
+      <div class="info-box"><span style="color:var(--gd);font-weight:700">RULES</span> &bull; Wait 9:30 candle &bull; 1-2 lots &bull; SL 40% &bull; Always hedge &bull; Exit before 3 PM</div>
     </div>
   </div>
 </div>
-
-<!-- ═══ TAB 2: OI ═══ -->
+<!-- TAB 2 -->
 <div id="pg2" class="hide">
   <div class="ld" id="p2ld"><span class="ldot"></span><span class="ldot"></span><span class="ldot"></span></div>
-  <div id="p2main" class="hide">
-    <div class="wrap">
-      <div id="oi-warn" class="warn-box hide">&#9888;&#65039; OI chain unavailable &mdash; showing estimated levels</div>
-      <div class="card">
-        <div class="ctitle">PUT / CALL RATIO &bull; LIVE</div>
-        <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px">
-          <span class="pcr-num" id="pcr-num">--</span>
-          <span style="font-size:15px;font-weight:700" id="pcr-bias">--</span>
-        </div>
-        <div class="pcr-track"><div class="pcr-fill" id="pcr-bar" style="width:50%"></div></div>
-        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt)">
-          <span>0.5 BEARISH</span><span>1.0 NEUTRAL</span><span>1.5+ BULLISH</span>
-        </div>
-        <div class="g4" style="margin-top:12px">
-          <div class="mt"><div class="ml">CALL OI</div><div class="mv sm rd" id="p2-co">--</div></div>
-          <div class="mt"><div class="ml">PUT OI</div><div class="mv sm gr" id="p2-po">--</div></div>
-          <div class="mt"><div class="ml">MAX PAIN</div><div class="mv sm gd" id="p2-mp">--</div></div>
-          <div class="mt"><div class="ml">EXPIRY</div><div class="mv sm ac" style="font-size:11px" id="p2-exp">--</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ctitle">STRADDLE &amp; RANGE</div>
-        <div class="g3">
-          <div class="mt"><div class="ml">STRADDLE</div><div class="mv ac" id="p2-str">--</div></div>
-          <div class="mt"><div class="ml">RANGE LOW</div><div class="mv rd" id="p2-rl">--</div></div>
-          <div class="mt"><div class="ml">RANGE HIGH</div><div class="mv gr" id="p2-rh">--</div></div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ctitle rd">&#128308; CALL WALLS &bull; RESISTANCE</div>
-        <div id="p2-cw">--</div>
-      </div>
-      <div class="card">
-        <div class="ctitle gr">&#128994; PUT WALLS &bull; SUPPORT</div>
-        <div id="p2-pw">--</div>
-      </div>
-      <div style="text-align:center;font-size:10px;color:var(--mt);padding:4px 0 8px">
-        Spot refreshes every 1s &bull; OI every 90s &bull; OI next in <span id="oi-cd">90</span>s
-      </div>
-    </div>
-  </div>
+  <div id="p2main" class="hide"><div class="wrap">
+    <div id="oi-warn" class="warn-box hide"></div>
+    <div class="card"><div class="ctitle">PUT / CALL RATIO</div><div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px"><span class="pcr-num" id="pcr-num">--</span><span style="font-size:15px;font-weight:700" id="pcr-bias">--</span></div><div class="pcr-track"><div class="pcr-fill" id="pcr-bar" style="width:50%"></div></div><div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt)"><span>0.5 BEARISH</span><span>1.0</span><span>1.5+ BULLISH</span></div><div class="g4" style="margin-top:12px"><div class="mt"><div class="ml">CALL OI</div><div class="mv sm rd" id="p2-co">--</div></div><div class="mt"><div class="ml">PUT OI</div><div class="mv sm gr" id="p2-po">--</div></div><div class="mt"><div class="ml">MAX PAIN</div><div class="mv sm gd" id="p2-mp">--</div></div><div class="mt"><div class="ml">EXPIRY</div><div class="mv sm ac" style="font-size:11px" id="p2-exp">--</div></div></div></div>
+    <div class="card"><div class="ctitle">STRADDLE &amp; RANGE</div><div class="g3"><div class="mt"><div class="ml">STRADDLE</div><div class="mv ac" id="p2-str">--</div></div><div class="mt"><div class="ml">RANGE LOW</div><div class="mv rd" id="p2-rl">--</div></div><div class="mt"><div class="ml">RANGE HIGH</div><div class="mv gr" id="p2-rh">--</div></div></div></div>
+    <div class="card"><div class="ctitle rd">CALL WALLS &bull; RESISTANCE</div><div id="p2-cw">--</div></div>
+    <div class="card"><div class="ctitle gr">PUT WALLS &bull; SUPPORT</div><div id="p2-pw">--</div></div>
+    <div style="text-align:center;font-size:10px;color:var(--mt);padding:4px 0 8px">OI refreshes every 60s in background &bull; <span id="oi-age">--</span></div>
+  </div></div>
 </div>
-
-<!-- ═══ TAB 3: MOMENTUM ═══ -->
+<!-- TAB 3 -->
 <div id="pg3" class="hide">
-  <div id="p3ld" class="ld"><span class="ldot"></span><span class="ldot"></span><span class="ldot"></span>
-    <div style="margin-top:14px;font-size:12px" id="p3ld-txt">Loading candle data...</div></div>
+  <div id="p3ld" class="ld"><span class="ldot"></span><span class="ldot"></span><span class="ldot"></span><div style="margin-top:14px;font-size:12px" id="p3ld-txt">Loading candle data...</div></div>
   <div id="p3main" class="hide">
-    <div class="hero" id="vwap-hero" style="margin-top:14px">
-      <div class="hero-lbl">VWAP SCALP SIGNAL &bull; 5-MIN CANDLES</div>
-      <div style="font-size:28px;font-weight:900" id="vs-act">--</div>
-      <div style="font-size:13px;margin-top:8px;color:var(--tx);line-height:1.6" id="vs-note">--</div>
-    </div>
+    <div class="hero" id="vwap-hero" style="margin-top:14px"><div class="hero-lbl">VWAP SCALP SIGNAL &bull; 5-MIN</div><div style="font-size:28px;font-weight:900" id="vs-act">--</div><div style="font-size:13px;margin-top:8px;color:var(--tx);line-height:1.6" id="vs-note">--</div></div>
     <div class="wrap">
-      <div class="card">
-        <div class="ctitle">VWAP BANDS &bull; <span id="p3-cnt" style="color:var(--acc)">-- candles</span></div>
-        <div class="g3">
-          <div class="mt"><div class="ml">UPPER BAND</div><div class="mv gr" id="p3-upper">--</div></div>
-          <div class="mt"><div class="ml">VWAP</div><div class="mv ac" id="p3-vwap">--</div></div>
-          <div class="mt"><div class="ml">LOWER BAND</div><div class="mv rd" id="p3-lower">--</div></div>
-        </div>
-        <div style="margin-top:14px">
-          <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt);margin-bottom:6px">
-            <span id="p3-lo">Low --</span>
-            <span class="ac" id="p3-rpos">--%</span>
-            <span id="p3-hi">High --</span>
-          </div>
-          <div class="vtrack">
-            <div class="vmid"></div>
-            <div class="vdot" id="p3-dot" style="left:50%"></div>
-          </div>
-          <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt);margin-top:3px">
-            <span>Below VWAP (Bear)</span><span>Above VWAP (Bull)</span>
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ctitle">MOMENTUM INDICATORS &bull; 5-MIN</div>
-        <div class="g2">
-          <div style="background:var(--s2);border-radius:12px;padding:14px">
-            <div class="ml">RSI (14)</div>
-            <div class="ind-big" id="p3-rsi">--</div>
-            <div style="font-size:12px;font-weight:700;margin-top:5px" id="p3-rlbl">--</div>
-            <div class="ind-track"><div class="ind-fill" id="p3-rbar" style="width:50%"></div></div>
-            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt)">
-              <span>0</span><span>30</span><span>50</span><span>70</span><span>100</span>
-            </div>
-          </div>
-          <div style="background:var(--s2);border-radius:12px;padding:14px">
-            <div class="ml">MACD HIST</div>
-            <div class="ind-big" id="p3-macd">--</div>
-            <div style="font-size:12px;font-weight:700;margin-top:5px" id="p3-mlbl">--</div>
-            <div style="margin-top:10px;font-size:10px;color:var(--mt);line-height:1.8">
-              +ve = Bull momentum<br>-ve = Bear momentum
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="ctitle">CANDLESTICK PATTERNS &bull; LAST 4 CANDLES</div>
-        <div id="p3-pats">Scanning...</div>
-      </div>
-      <div style="background:rgba(0,200,255,.04);border:1px solid rgba(0,200,255,.12);border-radius:14px;padding:14px;font-size:11px;color:var(--mt);line-height:2.1;margin-bottom:4px">
-        <span style="color:var(--acc);font-weight:700">SCALP RULES</span> &bull;
-        Above VWAP + RSI&gt;55 + MACD+ &#8594; Buy CE &bull;
-        Below VWAP + RSI&lt;45 + MACD- &#8594; Buy PE &bull;
-        Exit at opposite band &bull; Max 15 min &bull; SL 40%
-      </div>
+      <div class="card"><div class="ctitle">VWAP BANDS &bull; <span id="p3-cnt" style="color:var(--acc)"></span></div><div class="g3"><div class="mt"><div class="ml">UPPER BAND</div><div class="mv gr" id="p3-upper">--</div></div><div class="mt"><div class="ml">VWAP</div><div class="mv ac" id="p3-vwap">--</div></div><div class="mt"><div class="ml">LOWER BAND</div><div class="mv rd" id="p3-lower">--</div></div></div><div style="margin-top:14px"><div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt);margin-bottom:6px"><span id="p3-lo">Lower --</span><span class="ac" id="p3-rpos">--%</span><span id="p3-hi">Upper --</span></div><div class="vtrack"><div class="vmid"></div><div class="vdot" id="p3-dot" style="left:50%"></div></div><div style="display:flex;justify-content:space-between;font-size:9px;color:var(--mt);margin-top:3px"><span>Bear zone</span><span>Bull zone</span></div></div></div>
+      <div class="card"><div class="ctitle">INDICATORS &bull; 5-MIN</div><div class="g2"><div style="background:var(--s2);border-radius:12px;padding:14px"><div class="ml">RSI (14)</div><div class="ind-big" id="p3-rsi">--</div><div style="font-size:12px;font-weight:700;margin-top:5px" id="p3-rlbl">--</div><div class="ind-track"><div class="ind-fill" id="p3-rbar" style="width:50%"></div></div></div><div style="background:var(--s2);border-radius:12px;padding:14px"><div class="ml">MACD HIST</div><div class="ind-big" id="p3-macd">--</div><div style="font-size:12px;font-weight:700;margin-top:5px" id="p3-mlbl">--</div><div style="margin-top:10px;font-size:10px;color:var(--mt);line-height:1.8">+ve = Bullish<br>-ve = Bearish</div></div></div></div>
+      <div class="card"><div class="ctitle">CANDLESTICK PATTERNS</div><div id="p3-pats">Scanning...</div></div>
+      <div class="info-box"><span style="color:var(--acc);font-weight:700">SCALP RULES</span> &bull; Above VWAP + RSI&gt;55 + MACD+ = Buy CE &bull; Below VWAP + RSI&lt;45 + MACD- = Buy PE &bull; Exit at opposite band &bull; Max 15 min</div>
     </div>
   </div>
 </div>
-
 <script>
-var DATA = {spot:0,prev:0,oi:null,sig:null,ready:false};
-var oiCd = 90;
-var prevSpot = 0;
-
-// Helpers
+var DATA={spot:0,prev:0,oi:null,sig:null,ready:false};
+function eid(id){return document.getElementById(id);}
 function fi(n,d){d=d==null?2:d;return typeof n==="number"?n.toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):String(n||"--");}
 function fii(n){return typeof n==="number"?n.toLocaleString("en-IN"):String(n||"--");}
 function inr(n){return typeof n==="number"?"\u20B9"+n.toLocaleString("en-IN"):String(n||"--");}
 function gc(c){return c==="green"?"var(--gr)":c==="red"?"var(--rd)":"var(--gd)";}
-function eid(id){return document.getElementById(id);}
 function show(id){var e=eid(id);if(e)e.classList.remove("hide");}
 function hide(id){var e=eid(id);if(e)e.classList.add("hide");}
+function goTab(n){[1,2,3].forEach(function(i){var pg=eid("pg"+i);var tb=eid("tb"+i);if(pg)pg.className=i===n?"":"hide";if(tb)tb.className="tab"+(i===n?" on":"");});}
 
-// Tab switching
-function goTab(n){
-  [1,2,3].forEach(function(i){
-    var pg=eid("pg"+i); var tb=eid("tb"+i);
-    if(pg) pg.className=i===n?"":"hide";
-    if(tb) tb.className="tab"+(i===n?" on":"");
-  });
-  if(n===2 && DATA.oi) renderOI(DATA.oi);
-  if(n===3 && DATA.sig) renderMom(DATA.sig);
-}
-
-// ── Render Signal ─────────────────────────────────────────────
-function renderSignal(d){
-  if(!d.ok){
-    hide("p1ld"); hide("p1main");
-    show("p1err"); eid("p1em").textContent=d.error||"Connection failed";
-    return;
-  }
-  var sig=d.sig; var oi=d.oi; var col=gc(sig.color);
-  // Spot
-  var chg=d.spot-prevSpot;
-  if(prevSpot===0) chg=0;
-  eid("spot-num").textContent=fi(d.spot);
+function renderAll(d){
+  if(!d.ok){hide("p1ld");show("p1err");eid("p1em").textContent=d.error||"Error";return;}
+  var sig=d.sig;var oi=d.oi;var col=gc(sig.color);var spot=d.spot;
+  var chg=spot-(DATA.prev||spot); if(DATA.prev===0)chg=0;
+  // Header
+  eid("spot-num").textContent=fi(spot);
   eid("spot-num").style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--wh)";
-  if(chg!==0){
-    var pct=(chg/prevSpot*100);
-    var cb=eid("chg-badge");
-    cb.textContent=(chg>=0?"+":"")+fi(chg,2)+" ("+(pct>=0?"+":"")+fi(pct,2)+"%)";
-    cb.style.background=chg>0?"rgba(0,232,122,.12)":chg<0?"rgba(255,45,85,.12)":"rgba(255,255,255,.05)";
-    cb.style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--mt)";
-  }
-  eid("hdr-sub").textContent="ATM "+fii(oi.atm)+" \u2022 PCR "+oi.pcr+" \u2022 "+oi.expiry+(oi.live?"":" (est)");
+  if(chg!==0){var pct=chg/DATA.prev*100;var cb=eid("chg-badge");cb.textContent=(chg>=0?"+":"")+fi(chg,2)+" ("+(pct>=0?"+":"")+fi(pct,2)+"%)";cb.style.background=chg>0?"rgba(0,232,122,.12)":"rgba(255,45,85,.12)";cb.style.color=chg>0?"var(--gr)":"var(--rd)";}
+  eid("hdr-sub").textContent="ATM "+fii(oi.atm)+" \u2022 PCR "+(oi.pcr>0?oi.pcr:"N/A")+" \u2022 "+oi.expiry+(oi.live?"":" (est)");
   eid("upd-ts").textContent=d.ts;
-  eid("live-txt").textContent=d.market_open?"LIVE":"LIVE (mkt closed)";
-  // Hero
-  var hero=eid("sig-hero");
-  hero.className="hero "+(sig.color==="green"?"bull":sig.color==="red"?"bear":"");
+  eid("spot-age").textContent="Spot age: "+d.spot_age+"s"+(d.oi_age>=0?" \u2022 OI: "+d.oi_age+"s ago":"");
+  eid("live-txt").textContent=d.market_open?"LIVE":"LIVE (closed)";
+  // TAB 1: Signal
+  var hero=eid("sig-hero");hero.className="hero "+(sig.color==="green"?"bull":sig.color==="red"?"bear":"");
   eid("s-exp").textContent=oi.expiry;
-  var ae=eid("s-act"); ae.textContent=sig.action; ae.style.color=col;
-  var se=eid("s-str"); se.textContent=sig.action==="WAIT"?"No setup \u2014 wait for alignment":sig.strike; se.style.color=sig.action==="WAIT"?"var(--mt)":col;
-  var ce=eid("s-conf");
-  ce.textContent=sig.conf==="HIGH"?"HIGH CONFIDENCE":sig.conf==="MEDIUM"?"MEDIUM CONFIDENCE":sig.conf==="LOW"?"LOW \u2014 wait for more":"WAIT \u2014 NO SETUP";
-  ce.className="conf-chip "+(sig.conf==="HIGH"?"ch-hi":sig.conf==="MEDIUM"?"ch-md":"ch-lo");
+  var ae=eid("s-act");ae.textContent=sig.action;ae.style.color=col;
+  var se=eid("s-str");se.textContent=sig.action==="WAIT"?"No setup \u2014 wait for alignment":sig.strike;se.style.color=sig.action==="WAIT"?"var(--mt)":col;
+  var ce=eid("s-conf");ce.textContent=sig.conf==="HIGH"?"HIGH CONFIDENCE":sig.conf==="MEDIUM"?"MEDIUM":sig.conf==="LOW"?"LOW \u2014 wait more":"WAIT \u2014 NO SETUP";ce.className="conf-chip "+(sig.conf==="HIGH"?"ch-hi":sig.conf==="MEDIUM"?"ch-md":"ch-lo");
   eid("s-score").textContent="Score "+sig.score+"/9";
-  var sf=eid("s-sfill"); sf.style.width=sig.strength+"%"; sf.style.background=col;
+  var sf=eid("s-sfill");sf.style.width=sig.strength+"%";sf.style.background=col;
   eid("s-reasons").innerHTML=sig.reasons.map(function(r){return "<span class='reason-chip'>"+r+"</span>";}).join("");
-  // Trade details
-  eid("td-str").textContent=sig.strike; eid("td-str").style.color=col;
-  eid("td-hdg").textContent=sig.hedge;
-  eid("td-t1").textContent=fii(sig.t1); eid("td-t2").textContent=fii(sig.t2);
-  // Key levels
-  eid("kl-struct").innerHTML=
-    "<div class='rd'>\u25CF "+fii(oi.cw1)+" CE \u2190 CEILING</div>"
-    +"<div style='color:var(--ln)'>\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500</div>"
-    +"<div class='ac' style='font-size:16px;font-weight:800'>\u25C6 "+fi(d.spot)+" &nbsp; ATM "+fii(oi.atm)+"</div>"
-    +"<div style='color:var(--ln)'>\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500</div>"
-    +"<div class='gr'>\u25CF "+fii(oi.pw1)+" PE \u2190 FLOOR</div>"
-    +"<div class='gd' style='font-size:12px;margin-top:4px'>Max Pain: "+fii(oi.mp)+" &bull; Straddle: "+inr(oi.straddle)+"</div>";
-  hide("p1ld"); hide("p1err"); show("p1main");
-}
-
-// ── Render OI ─────────────────────────────────────────────────
-function renderOI(oi){
-  if(!oi) return;
+  eid("td-str").textContent=sig.strike;eid("td-str").style.color=col;
+  eid("td-hdg").textContent=sig.hedge;eid("td-t1").textContent=fii(sig.t1);eid("td-t2").textContent=fii(sig.t2);
+  eid("kl-struct").innerHTML="<div class='rd'>\u25CF "+fii(oi.cw1)+" CE \u2190 CEILING</div><div style='color:var(--ln)'>\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500</div><div class='ac' style='font-size:16px;font-weight:800'>\u25C6 "+fi(spot)+" &nbsp; ATM "+fii(oi.atm)+"</div><div style='color:var(--ln)'>\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500</div><div class='gr'>\u25CF "+fii(oi.pw1)+" PE \u2190 FLOOR</div><div class='gd' style='font-size:12px;margin-top:4px'>Max Pain: "+fii(oi.mp)+" \u2022 Straddle: "+inr(oi.straddle)+"</div>";
+  hide("p1ld");hide("p1err");show("p1main");
+  // TAB 2: OI
   hide("p2ld");
-  // Warn if estimated
-  if(!oi.live) show("oi-warn"); else hide("oi-warn");
-  // PCR
-  var col=oi.pcr>=1?"var(--gr)":oi.pcr>=0.9?"var(--gd)":"var(--rd)";
-  var bias=oi.pcr>=1.4?"STRONGLY BULLISH":oi.pcr>=1.2?"BULLISH":oi.pcr>=1.0?"MILDLY BULLISH":
-           oi.pcr>=0.9?"NEUTRAL":oi.pcr>=0.75?"MILDLY BEARISH":oi.pcr>=0.6?"BEARISH":"STRONGLY BEARISH";
-  eid("pcr-num").textContent=oi.pcr; eid("pcr-num").style.color=col;
-  eid("pcr-bias").textContent=bias; eid("pcr-bias").style.color=col;
-  eid("pcr-bar").style.width=Math.min(oi.pcr/2*100,100)+"%";
+  if(!oi.live){show("oi-warn");eid("oi-warn").textContent="\u26A0 OI chain not loaded \u2014 PCR and walls are estimated. Live data loads during market hours.";}else{hide("oi-warn");}
+  var pcol=oi.pcr>=1?"var(--gr)":oi.pcr>=0.9?"var(--gd)":"var(--rd)";
+  if(oi.pcr===0){pcol="var(--mt)";}
+  var bias=oi.pcr===0?"NO DATA":oi.pcr>=1.4?"STRONGLY BULLISH":oi.pcr>=1.2?"BULLISH":oi.pcr>=1.0?"MILDLY BULLISH":oi.pcr>=0.9?"NEUTRAL":oi.pcr>=0.75?"MILDLY BEARISH":oi.pcr>=0.6?"BEARISH":"STRONGLY BEARISH";
+  eid("pcr-num").textContent=oi.pcr>0?oi.pcr:"--";eid("pcr-num").style.color=pcol;
+  eid("pcr-bias").textContent=bias;eid("pcr-bias").style.color=pcol;
+  eid("pcr-bar").style.width=oi.pcr>0?Math.min(oi.pcr/2*100,100)+"%":"0%";
   eid("p2-co").textContent=oi.c_cr>0?oi.c_cr+"Cr":"--";
   eid("p2-po").textContent=oi.p_cr>0?oi.p_cr+"Cr":"--";
-  eid("p2-mp").textContent=fii(oi.mp);
-  eid("p2-exp").textContent=oi.expiry;
+  eid("p2-mp").textContent=fii(oi.mp);eid("p2-exp").textContent=oi.expiry;
   eid("p2-str").innerHTML=inr(oi.straddle);
-  eid("p2-rl").textContent=fii(oi.range_low);
-  eid("p2-rh").textContent=fii(oi.range_high);
-  // OI walls
-  function oiWall(walls,isCall){
-    if(!walls||!walls.length||!oi.live)
-      return "<div style='color:var(--mt);font-size:12px;padding:6px 0'>"+
-             (oi.live?"No data":"Estimated \u2014 live OI loads when market opens")+"</div>";
-    var col=isCall?"var(--rd)":"var(--gr)";
-    var mx=Math.max.apply(null,walls.map(function(w){return parseFloat(w.oi)||1;}));
-    return walls.map(function(w){
-      var pct=Math.min((parseFloat(w.oi)||0)/mx*100,100);
-      return "<div class='oi-item'>"
-        +"<div class='oi-top'>"
-        +"<span style='color:var(--wh);font-size:15px;font-weight:700'>"+fii(w.s)+" "+(isCall?"CE":"PE")+"</span>"
-        +"<span style='color:"+col+";font-size:13px;font-weight:600'>"+w.oi+"L OI</span>"
-        +"</div>"
-        +"<div class='oi-track'><div class='oi-fill' style='width:"+pct+"%;background:"+col+"'></div></div>"
-        +"</div>";
-    }).join("");
-  }
-  eid("p2-cw").innerHTML=oiWall(oi.calls,true);
-  eid("p2-pw").innerHTML=oiWall(oi.puts,false);
+  eid("p2-rl").textContent=fii(oi.range_low);eid("p2-rh").textContent=fii(oi.range_high);
+  function oiW(walls,isCall){if(!walls||!walls.length||!oi.live)return"<div style='color:var(--mt);font-size:12px;padding:6px 0'>"+(oi.live?"No data":"Estimated \u2014 live OI when market opens")+"</div>";var col2=isCall?"var(--rd)":"var(--gr)";var mx=Math.max.apply(null,walls.map(function(w){return parseFloat(w.oi)||1;}));return walls.map(function(w){var pct=Math.min((parseFloat(w.oi)||0)/mx*100,100);return"<div class='oi-item'><div class='oi-top'><span style='color:var(--wh);font-size:15px;font-weight:700'>"+fii(w.s)+" "+(isCall?"CE":"PE")+"</span><span style='color:"+col2+";font-size:13px;font-weight:600'>"+w.oi+"L</span></div><div class='oi-track'><div class='oi-fill' style='width:"+pct+"%;background:"+col2+"'></div></div></div>";}).join("");}
+  eid("p2-cw").innerHTML=oiW(oi.calls,true);eid("p2-pw").innerHTML=oiW(oi.puts,false);
+  eid("oi-age").textContent=d.oi_age>=0?"OI updated "+d.oi_age+"s ago":"OI not yet loaded";
   show("p2main");
-}
-
-// ── Render Momentum ───────────────────────────────────────────
-function renderMom(sig){
-  if(!sig) return;
-  // Market closed / no candles
-  if(!sig.candles_count||sig.candles_count===0){
-    eid("p3ld-txt").textContent="No candle data \u2014 available from 9:20 AM on trading days";
-    show("p3ld"); hide("p3main"); return;
-  }
-  if(sig.vwap===0){
-    eid("p3ld-txt").textContent="VWAP calculating \u2014 need at least 5 candles (opens 9:40 AM)";
-    show("p3ld"); hide("p3main"); return;
-  }
-  hide("p3ld");
-  // VWAP signal
-  var col=gc(sig.color); var vh=eid("vwap-hero");
-  vh.className="hero "+(sig.color==="green"?"bull":sig.color==="red"?"bear":"");
-  var icon=sig.color==="green"?"\u25B2 ":sig.color==="red"?"\u25BC ":"\u25A0 ";
-  eid("vs-act").innerHTML="<span style='color:"+col+"'>"+icon+sig.action+"</span>";
-  eid("vs-note").textContent=sig.reasons.slice(0,3).join(" \u2022 ");
-  // VWAP bands
-  eid("p3-cnt").textContent=sig.candles_count+" candles";
-  eid("p3-upper").textContent=fii(sig.upper);
-  eid("p3-vwap").textContent=fii(sig.vwap);
-  eid("p3-lower").textContent=fii(sig.lower);
-  // Position dot - need day high/low from OI or approx from bands
-  var spot=DATA.spot;
-  var vpos=sig.upper>sig.lower?Math.min(Math.max((spot-sig.lower)/(sig.upper-sig.lower)*100,0),100):50;
-  eid("p3-dot").style.left=vpos+"%";
-  eid("p3-rpos").textContent="Position "+Math.round(vpos)+"% in band";
-  eid("p3-lo").textContent="Lower "+fii(sig.lower);
-  eid("p3-hi").textContent="Upper "+fii(sig.upper);
-  // RSI
-  var rsi=sig.rsi;
-  var rcol=rsi>=70?"var(--rd)":rsi>=60?"var(--gr)":rsi>=45?"var(--gd)":rsi>=30?"var(--rd)":"var(--gr)";
-  var rlbl=rsi>=70?"OVERBOUGHT \u2014 caution":rsi>=60?"BULLISH":rsi>=45?"NEUTRAL":rsi>=30?"BEARISH":"OVERSOLD \u2014 watch for reversal";
-  eid("p3-rsi").textContent=rsi; eid("p3-rsi").style.color=rcol;
-  eid("p3-rlbl").textContent=rlbl; eid("p3-rlbl").style.color=rcol;
-  eid("p3-rbar").style.width=rsi+"%"; eid("p3-rbar").style.background=rcol;
-  // MACD
-  var hist=sig.hist; var mcol=hist>0?"var(--gr)":"var(--rd)";
-  eid("p3-macd").textContent=hist>0?"+"+hist:String(hist); eid("p3-macd").style.color=mcol;
-  eid("p3-mlbl").textContent=hist>0?"BULL CROSS \u25B2":"BEAR CROSS \u25BC"; eid("p3-mlbl").style.color=mcol;
-  // Patterns
-  var pats=sig.patterns||[];
-  if(!pats.length){
-    eid("p3-pats").innerHTML="<div style='color:var(--mt);font-size:12px;padding:4px 0'>No strong patterns \u2014 market consolidating</div>";
+  // TAB 3: Momentum
+  if(!sig.candles_count||sig.candles_count<2){eid("p3ld-txt").textContent="No candle data \u2014 loads 9:20 AM on trading days";show("p3ld");hide("p3main");
+  } else if(sig.vwap===0){eid("p3ld-txt").textContent="Calculating VWAP \u2014 need more candles";show("p3ld");hide("p3main");
   } else {
-    eid("p3-pats").innerHTML=pats.map(function(p){
-      return "<span class='pat "+(p.type==="bullish"?"bull":p.type==="bearish"?"bear":"neutral")+"'>"+p.name+" \u2014 "+p.desc+"</span>";
-    }).join("");
+    hide("p3ld");var vh=eid("vwap-hero");vh.className="hero "+(sig.color==="green"?"bull":sig.color==="red"?"bear":"");
+    var icon=sig.color==="green"?"\u25B2 ":sig.color==="red"?"\u25BC ":"\u25A0 ";
+    eid("vs-act").innerHTML="<span style='color:"+col+"'>"+icon+sig.action+"</span>";
+    eid("vs-note").textContent=sig.reasons.slice(0,3).join(" \u2022 ");
+    eid("p3-cnt").textContent=sig.candles_count+" candles";
+    eid("p3-upper").textContent=fii(sig.upper);eid("p3-vwap").textContent=fii(sig.vwap);eid("p3-lower").textContent=fii(sig.lower);
+    var vpos=sig.upper>sig.lower?Math.min(Math.max((spot-sig.lower)/(sig.upper-sig.lower)*100,0),100):50;
+    eid("p3-dot").style.left=vpos+"%";eid("p3-rpos").textContent=Math.round(vpos)+"%";
+    eid("p3-lo").textContent="Lower "+fii(sig.lower);eid("p3-hi").textContent="Upper "+fii(sig.upper);
+    var rsi=sig.rsi;var rcol=rsi>=70?"var(--rd)":rsi>=60?"var(--gr)":rsi>=45?"var(--gd)":rsi>=30?"var(--rd)":"var(--gr)";
+    var rlbl=rsi>=70?"OVERBOUGHT":rsi>=60?"BULLISH":rsi>=45?"NEUTRAL":rsi>=30?"BEARISH":"OVERSOLD";
+    eid("p3-rsi").textContent=rsi;eid("p3-rsi").style.color=rcol;eid("p3-rlbl").textContent=rlbl;eid("p3-rlbl").style.color=rcol;eid("p3-rbar").style.width=rsi+"%";eid("p3-rbar").style.background=rcol;
+    var h2=sig.hist;var mcol=h2>0?"var(--gr)":"var(--rd)";
+    eid("p3-macd").textContent=h2>0?"+"+h2:String(h2);eid("p3-macd").style.color=mcol;
+    eid("p3-mlbl").textContent=h2>0?"BULL CROSS \u25B2":"BEAR CROSS \u25BC";eid("p3-mlbl").style.color=mcol;
+    var pats=sig.patterns||[];
+    eid("p3-pats").innerHTML=!pats.length?"<div style='color:var(--mt);font-size:12px'>No strong patterns</div>":pats.map(function(p){return"<span class='pat "+(p.type==="bullish"?"bull":p.type==="bearish"?"bear":"")+"'>"+p.name+" \u2014 "+p.desc+"</span>";}).join("");
+    show("p3main");
   }
-  show("p3main");
+  DATA.ready=true;
 }
 
-// ── Fetch ─────────────────────────────────────────────────────
-async function fetchAll(){
-  try{
-    var r=await fetch("/api/live?_="+Date.now());
-    var d=await r.json();
-    if(d.ok){
-      prevSpot=DATA.spot||d.spot;
-      DATA.spot=d.spot; DATA.oi=d.oi; DATA.sig=d.sig; DATA.ready=true;
-      renderSignal(d);
-      renderOI(d.oi);
-      renderMom(d.sig);
-    } else {
-      if(!DATA.ready){
-        hide("p1ld"); show("p1err");
-        eid("p1em").textContent=d.error||"API error";
-      }
-    }
-  }catch(e){
-    if(!DATA.ready){
-      hide("p1ld"); show("p1err");
-      eid("p1em").textContent="Network: "+e.message;
-    }
-  }
+// ── Polling ───────────────────────────────────────────────────
+async function fetchSpot(){
+  try{var r=await fetch("/api/spot");var d=await r.json();if(d.spot){DATA.prev=DATA.spot||d.spot;DATA.spot=d.spot;eid("spot-num").textContent=fi(d.spot);var chg=d.spot-DATA.prev;eid("spot-num").style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--wh)";eid("upd-ts").textContent=d.ts;}}catch(e){}
 }
-
-function forceRefresh(){
-  DATA.ready=false; DATA.spot=0; prevSpot=0;
-  hide("p1main"); hide("p1err"); show("p1ld");
-  fetchAll();
+async function fetchFull(){
+  try{var r=await fetch("/api/live?_="+Date.now());var d=await r.json();if(d.ok){DATA.prev=DATA.spot||d.spot;DATA.spot=d.spot;DATA.oi=d.oi;DATA.sig=d.sig;renderAll(d);}else if(!DATA.ready){hide("p1ld");show("p1err");eid("p1em").textContent=d.error;}}
+  catch(e){if(!DATA.ready){hide("p1ld");show("p1err");eid("p1em").textContent="Network: "+e.message;}}
 }
-
-// OI countdown
-setInterval(function(){
-  oiCd--; if(oiCd<0) oiCd=90;
-  var e=eid("oi-cd"); if(e) e.textContent=oiCd;
-},1000);
-
-// Poll every 3 seconds
-fetchAll();
-setInterval(fetchAll, 1000);
+// Full data every 10s, spot every 1s
+fetchFull();
+setInterval(fetchSpot,1000);
+setInterval(fetchFull,10000);
 </script>
 </body></html>"""
 
