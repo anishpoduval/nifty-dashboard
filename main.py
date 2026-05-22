@@ -272,18 +272,44 @@ def compute_signal(spot, oi, candles):
 
 # ── Background thread: SPOT every 1s ─────────────────────────
 def bg_spot():
+    """Fetch spot every 3s via REST quote (fastest reliable method)"""
     while True:
         try:
             obj, jwt = get_obj()
-            s = fetch_spot_rest(obj, jwt)
-            if s > 0:
-                _c["spot"] = s
-            if _c["spot"] > 0:
+            # Try REST quote first (most reliable for frequent polling)
+            fetched = False
+            for token in ["99926000", "26000"]:
+                try:
+                    r = requests.post(
+                        "https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/",
+                        json={"mode":"LTP","exchangeTokens":{"NSE":[token]}},
+                        headers=rest_headers(jwt), timeout=5)
+                    d = r.json()
+                    ltp = (d.get("data",{}).get("fetched") or [{}])[0].get("ltp",0)
+                    if ltp and float(ltp) > 0:
+                        _c["spot"] = float(ltp)
+                        _c["spot_ts"] = time.time()
+                        fetched = True
+                        break
+                except: pass
+            # Fallback to ltpData
+            if not fetched:
+                for exch, sym, token in [("NSE","Nifty 50","99926000"),("NSE","Nifty 50","26000")]:
+                    try:
+                        r2 = obj.ltpData(exch, sym, token)
+                        if r2.get("status") and r2.get("data",{}).get("ltp"):
+                            _c["spot"] = float(r2["data"]["ltp"])
+                            _c["spot_ts"] = time.time()
+                            break
+                    except: pass
+            # Fallback to last candle
+            if _c["spot"] == 0 and _c["candles"]:
+                _c["spot"] = float(_c["candles"][-1][4])
                 _c["spot_ts"] = time.time()
         except Exception as e:
             _c["errors"].append("spot:"+str(e)[:60])
             _c["errors"] = _c["errors"][-5:]
-        time.sleep(1)
+        time.sleep(3)
 
 # ── Background thread: OI + Candles every 60s ────────────────
 def bg_heavy():
@@ -543,7 +569,9 @@ function renderAll(d){
   // Header
   eid("spot-num").textContent=fi(spot);
   eid("spot-num").style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--wh)";
-  if(chg!==0){var pct=chg/(DATA.prev||spot)*100;var cb=eid("chg-badge");cb.textContent=(chg>=0?"+":"")+fi(chg,2)+" ("+(pct>=0?"+":"")+fi(pct,2)+"%)";cb.style.background=chg>0?"rgba(0,232,122,.12)":"rgba(255,45,85,.12)";cb.style.color=chg>0?"var(--gr)":"var(--rd)";}
+  var cb=eid("chg-badge");
+  if(chg!==0&&DATA.prev>0){var pct=chg/DATA.prev*100;cb.textContent=(chg>=0?"+":"")+fi(chg,2)+" ("+(pct>=0?"+":"")+fi(pct,2)+"%)";cb.style.background=chg>0?"rgba(0,232,122,.12)":"rgba(255,45,85,.12)";cb.style.color=chg>0?"var(--gr)":"var(--rd)";}
+  else if(DATA.prev>0){cb.textContent="0.00 (0.00%)";cb.style.background="rgba(255,255,255,.05)";cb.style.color="var(--mt)";}
   eid("hdr-sub").textContent="ATM "+fii(oi.atm)+" \u2022 PCR "+(oi.pcr>0?oi.pcr:"N/A")+(oi.live?" \u2022 "+oi.expiry:" \u2022 OI loading...");
   eid("upd-ts").textContent=d.ts;
   eid("data-age").textContent="Spot:"+d.spot_age+"s"+(d.oi_age>=0?" OI:"+d.oi_age+"s":"")+" Candles:"+d.candles;
@@ -623,10 +651,17 @@ async function pollSpot(){
   try{
     var r=await fetch("/api/spot");var d=await r.json();
     if(d.spot>0){
-      DATA.prev=DATA.spot||d.spot;DATA.spot=d.spot;
-      eid("spot-num").textContent=fi(d.spot);
-      var chg=d.spot-DATA.prev;
-      eid("spot-num").style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--wh)";
+      var prev=DATA.spot||d.spot;
+      if(d.spot!==DATA.spot){
+        DATA.prev=prev;DATA.spot=d.spot;
+        eid("spot-num").textContent=fi(d.spot);
+        var chg=d.spot-prev;
+        eid("spot-num").style.color=chg>0?"var(--gr)":chg<0?"var(--rd)":"var(--wh)";
+        // Flash pulse dot green on update
+        var dot=eid("live-txt").previousElementSibling;
+        if(dot){dot.style.background="var(--acc)";}
+        setTimeout(function(){var dot2=eid("live-txt").previousElementSibling;if(dot2)dot2.style.background="var(--gr)";},300);
+      }
       eid("upd-ts").textContent=d.ts;
     }
   }catch(e){}
